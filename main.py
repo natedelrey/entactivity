@@ -1,0 +1,1206 @@
+"""
+Ethics Committee Operations Bot
+- Discord slash commands
+- Roblox verification
+- Roblox activity webhooks
+- Weekly activity reporting
+- Strike management
+- Roblox rank service integration
+
+Designed for Railway + PostgreSQL.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+import os
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import aiohttp
+import asyncpg
+import discord
+from aiohttp import web
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+load_dotenv()
+
+UTC = dt.timezone.utc
+
+
+# ============================================================
+# Config helpers
+# ============================================================
+
+def getenv_str(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip()
+
+
+def getenv_int(name: str, default: int | None = None) -> int | None:
+    value = getenv_str(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[CONFIG] {name} must be an integer. Using default: {default}")
+        return default
+
+
+def getenv_bool(name: str, default: bool = False) -> bool:
+    value = getenv_str(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def getenv_color(name: str, default_hex: str = "2A3825") -> discord.Color:
+    raw = getenv_str(name, default_hex) or default_hex
+    raw = raw.strip().replace("#", "")
+    try:
+        return discord.Color(int(raw, 16))
+    except ValueError:
+        print(f"[CONFIG] Invalid color {name}={raw}. Using #{default_hex}.")
+        return discord.Color(int(default_hex, 16))
+
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(UTC)
+
+
+def fmt_minutes(minutes: int) -> str:
+    minutes = max(0, int(minutes))
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours}h {mins}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
+def week_key(date: dt.datetime | None = None) -> str:
+    d = date or utcnow()
+    iso = d.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def normalize_base_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    clean = url.strip().rstrip("/")
+    if not clean.startswith(("http://", "https://")):
+        clean = "https://" + clean
+    return clean
+
+
+@dataclass(frozen=True)
+class BotConfig:
+    # Core
+    bot_token: str | None = getenv_str("BOT_TOKEN")
+    database_url: str | None = getenv_str("DATABASE_URL")
+    port: int = getenv_int("PORT", 8080) or 8080
+
+    # Department branding
+    department_name: str = getenv_str("DEPARTMENT_NAME", "Ethics Committee") or "Ethics Committee"
+    department_abbrev: str = getenv_str("DEPARTMENT_ABBREVIATION", "EC") or "EC"
+    department_color: discord.Color = getenv_color("DEPARTMENT_COLOR", "2A3825")
+    department_group_url: str = getenv_str(
+        "DEPARTMENT_GROUP_URL",
+        "https://www.roblox.com/communities/34438615/",
+    ) or "https://www.roblox.com/communities/34438615/"
+
+    # Discord channels
+    activity_log_channel_id: int | None = getenv_int("ACTIVITY_LOG_CHANNEL_ID")
+    command_log_channel_id: int | None = getenv_int("COMMAND_LOG_CHANNEL_ID")
+    roblox_audit_log_channel_id: int | None = getenv_int("ROBLOX_AUDIT_LOG_CHANNEL_ID")
+    welcome_channel_id: int | None = getenv_int("WELCOME_CHANNEL_ID")
+    weekly_report_channel_id: int | None = getenv_int("WEEKLY_REPORT_CHANNEL_ID")
+
+    # Roles
+    management_role_id: int | None = getenv_int("MANAGEMENT_ROLE_ID")
+    rank_manager_role_id: int | None = getenv_int("RANK_MANAGER_ROLE_ID")
+    strike_manager_role_id: int | None = getenv_int("STRIKE_MANAGER_ROLE_ID")
+    activity_manager_role_id: int | None = getenv_int("ACTIVITY_MANAGER_ROLE_ID")
+    welcome_manager_role_id: int | None = getenv_int("WELCOME_MANAGER_ROLE_ID")
+    department_role_id: int | None = getenv_int("DEPARTMENT_ROLE_ID")
+
+    # Roblox service/webhooks
+    api_secret_key: str | None = getenv_str("API_SECRET_KEY")
+    roblox_group_id: int = getenv_int("ROBLOX_GROUP_ID", 34438615) or 34438615
+    roblox_service_base: str | None = normalize_base_url(getenv_str("ROBLOX_SERVICE_BASE"))
+    roblox_service_secret: str | None = getenv_str("ROBLOX_SERVICE_SECRET")
+
+    # Activity
+    weekly_time_requirement: int = getenv_int("WEEKLY_TIME_REQUIREMENT", 120) or 120
+    auto_weekly_report: bool = getenv_bool("AUTO_WEEKLY_REPORT", False)
+    auto_weekly_reset: bool = getenv_bool("AUTO_WEEKLY_RESET", False)
+    auto_report_weekday_utc: int = getenv_int("AUTO_REPORT_WEEKDAY_UTC", 6) or 6  # Sunday
+    auto_report_hour_utc: int = getenv_int("AUTO_REPORT_HOUR_UTC", 0) or 0
+    auto_inactivity_strikes: bool = getenv_bool("AUTO_INACTIVITY_STRIKES", False)
+
+    # Strikes
+    default_strike_duration_days: int = getenv_int("DEFAULT_STRIKE_DURATION_DAYS", 30) or 30
+    max_strikes: int = getenv_int("MAX_STRIKES", 3) or 3
+
+    # Welcome
+    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to the Ethics Committee") or "Welcome to the Ethics Committee"
+    welcome_message: str = getenv_str(
+        "WELCOME_MESSAGE",
+        "Welcome {member} to the Ethics Committee! Please verify with `/verify`, review the handbook, and stay active on-site.",
+    ) or "Welcome {member} to the Ethics Committee! Please verify with `/verify`, review the handbook, and stay active on-site."
+
+
+CONFIG = BotConfig()
+
+
+# ============================================================
+# Discord setup
+# ============================================================
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = False
+
+activity_group = app_commands.Group(name="activity", description=f"{CONFIG.department_abbrev} activity tracking commands.")
+strikes_group = app_commands.Group(name="strikes", description=f"{CONFIG.department_abbrev} strike management commands.")
+
+
+def is_default_role(role: discord.Role) -> bool:
+    return role.is_default() or role.id == role.guild.id
+
+
+class ECBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.db_pool: asyncpg.Pool | None = None
+        self.web_runner: web.AppRunner | None = None
+        self.web_site: web.TCPSite | None = None
+        self._bootstrap_lock = asyncio.Lock()
+        self._bootstrapped = False
+
+    async def setup_hook(self) -> None:
+        if not CONFIG.database_url:
+            print("[DB] Missing DATABASE_URL. Database commands will not work.")
+        else:
+            try:
+                self.db_pool = await asyncpg.create_pool(CONFIG.database_url, min_size=1, max_size=10)
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                print("[DB] Connected.")
+            except Exception as exc:
+                print(f"[DB] Connection failed: {exc}")
+
+        await self.ensure_bootstrap()
+
+    async def ensure_bootstrap(self) -> None:
+        if self._bootstrapped:
+            return
+        async with self._bootstrap_lock:
+            if self._bootstrapped:
+                return
+
+            if self.db_pool:
+                await self.setup_database()
+
+            await self.setup_web_server()
+
+            try:
+                self.tree.add_command(activity_group)
+            except app_commands.CommandAlreadyRegistered:
+                pass
+            try:
+                self.tree.add_command(strikes_group)
+            except app_commands.CommandAlreadyRegistered:
+                pass
+
+            try:
+                synced = await self.tree.sync()
+                print(f"[Slash] Synced {len(synced)} command(s).")
+            except Exception as exc:
+                print(f"[Slash] Sync failed: {exc}")
+
+            self._bootstrapped = True
+
+    async def setup_database(self) -> None:
+        assert self.db_pool is not None
+        async with self.db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS roblox_verification (
+                    discord_id BIGINT PRIMARY KEY,
+                    roblox_id BIGINT UNIQUE NOT NULL,
+                    roblox_username TEXT,
+                    verified_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS roblox_sessions (
+                    roblox_id BIGINT PRIMARY KEY,
+                    discord_id BIGINT,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS roblox_activity (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id BIGINT NOT NULL,
+                    roblox_id BIGINT,
+                    week_key TEXT NOT NULL,
+                    minutes INT NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'webhook',
+                    reason TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS activity_adjustments (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id BIGINT NOT NULL,
+                    minutes_delta INT NOT NULL,
+                    reason TEXT NOT NULL,
+                    adjusted_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS strikes (
+                    strike_id BIGSERIAL PRIMARY KEY,
+                    member_id BIGINT NOT NULL,
+                    reason TEXT NOT NULL,
+                    issued_by BIGINT,
+                    issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    auto BOOLEAN NOT NULL DEFAULT FALSE,
+                    removed_by BIGINT,
+                    removed_reason TEXT,
+                    removed_at TIMESTAMPTZ
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS member_ranks (
+                    discord_id BIGINT PRIMARY KEY,
+                    rank_name TEXT NOT NULL,
+                    set_by BIGINT,
+                    set_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS weekly_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    week_key TEXT NOT NULL,
+                    report_json JSONB NOT NULL,
+                    created_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+        print("[DB] Tables ready.")
+
+    async def setup_web_server(self) -> None:
+        if self.web_runner:
+            return
+        app = web.Application()
+        app.router.add_get("/health", self.health_handler)
+        app.router.add_post("/roblox", self.roblox_handler)
+        app.router.add_post("/roblox/audit", self.roblox_audit_handler)
+        self.web_runner = web.AppRunner(app)
+        await self.web_runner.setup()
+        self.web_site = web.TCPSite(self.web_runner, "0.0.0.0", CONFIG.port)
+        await self.web_site.start()
+        print(f"[Web] Server running on :{CONFIG.port}.")
+
+    async def health_handler(self, request: web.Request) -> web.Response:
+        return web.Response(text="ok", status=200)
+
+    def check_webhook_secret(self, request: web.Request) -> bool:
+        # If API_SECRET_KEY is configured, require it. If not configured, allow local/dev testing.
+        if not CONFIG.api_secret_key:
+            return True
+        return request.headers.get("X-Secret-Key") == CONFIG.api_secret_key
+
+    async def roblox_handler(self, request: web.Request) -> web.Response:
+        if not self.check_webhook_secret(request):
+            await self.log_command("Webhook Rejected", "`POST /roblox` rejected due to invalid secret.")
+            return web.Response(status=401, text="unauthorized")
+        if not self.db_pool:
+            return web.json_response({"ok": False, "error": "database_unavailable"}, status=500)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        roblox_id = data.get("robloxId") or data.get("roblox_id")
+        status = str(data.get("status") or data.get("event") or "").lower().strip()
+        if not roblox_id or status not in {"joined", "left"}:
+            return web.json_response({"ok": False, "error": "expected robloxId and status joined|left"}, status=400)
+
+        try:
+            roblox_id = int(roblox_id)
+        except ValueError:
+            return web.json_response({"ok": False, "error": "invalid_roblox_id"}, status=400)
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT discord_id, roblox_username FROM roblox_verification WHERE roblox_id=$1",
+                roblox_id,
+            )
+
+        if not row:
+            await self.log_command("Unverified Roblox Activity", f"Roblox ID `{roblox_id}` sent `{status}` but is not verified.")
+            return web.json_response({"ok": True, "verified": False})
+
+        discord_id = int(row["discord_id"])
+        member = self.find_member(discord_id)
+        display = member.mention if member else f"Discord ID `{discord_id}`"
+
+        if status == "joined":
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO roblox_sessions (roblox_id, discord_id, started_at)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (roblox_id) DO UPDATE SET discord_id=$2, started_at=$3
+                    """,
+                    roblox_id,
+                    discord_id,
+                    utcnow(),
+                )
+            await self.send_activity_log("🟢 Joined Site", f"{display} started a site session.", discord.Color.green())
+            return web.json_response({"ok": True, "status": "joined"})
+
+        async with self.db_pool.acquire() as conn:
+            session = await conn.fetchrow("SELECT started_at FROM roblox_sessions WHERE roblox_id=$1", roblox_id)
+            if session:
+                await conn.execute("DELETE FROM roblox_sessions WHERE roblox_id=$1", roblox_id)
+
+        if not session:
+            await self.send_activity_log(
+                "🔴 Left Site",
+                f"{display} ended a site session, but no start time was found.",
+                discord.Color.orange(),
+            )
+            return web.json_response({"ok": True, "status": "left", "tracked_minutes": 0})
+
+        started_at: dt.datetime = session["started_at"]
+        minutes = max(0, int((utcnow() - started_at).total_seconds() // 60))
+        wk = week_key()
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO roblox_activity (discord_id, roblox_id, week_key, minutes, source, reason)
+                VALUES ($1, $2, $3, $4, 'webhook', 'Roblox session ended')
+                """,
+                discord_id,
+                roblox_id,
+                wk,
+                minutes,
+            )
+            weekly = await self.fetch_weekly_minutes(conn, discord_id, wk)
+
+        await self.send_activity_log(
+            "🔴 Left Site",
+            (
+                f"{display} ended their site session.\n"
+                f"Session time: **{fmt_minutes(minutes)}**\n"
+                f"This week: **{fmt_minutes(weekly)}/{fmt_minutes(CONFIG.weekly_time_requirement)}**"
+            ),
+            discord.Color.red(),
+        )
+        return web.json_response({"ok": True, "status": "left", "tracked_minutes": minutes})
+
+    async def roblox_audit_handler(self, request: web.Request) -> web.Response:
+        if not self.check_webhook_secret(request):
+            await self.log_command("Webhook Rejected", "`POST /roblox/audit` rejected due to invalid secret.")
+            return web.Response(status=401, text="unauthorized")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        event = str(data.get("event") or data.get("action") or data.get("eventType") or "Audit Event")
+        actor = str(data.get("actor") or data.get("author") or data.get("username") or "Unknown")
+        target = str(data.get("target") or data.get("recipient") or data.get("targetUser") or "Unknown")
+        reason = str(data.get("reason") or data.get("description") or "No reason provided")
+        occurred = str(data.get("timestamp") or data.get("createdAt") or utcnow().isoformat())
+
+        embed = discord.Embed(title="📋 Roblox Group Audit Logged", color=CONFIG.department_color, timestamp=utcnow())
+        embed.add_field(name="Event", value=event[:1024], inline=True)
+        embed.add_field(name="By", value=actor[:1024], inline=True)
+        embed.add_field(name="Target", value=target[:1024], inline=True)
+        embed.add_field(name="Occurred", value=occurred[:1024], inline=False)
+        embed.add_field(name="Reason", value=reason[:1024], inline=False)
+        raw = json.dumps(data, ensure_ascii=False)
+        if len(raw) > 1000:
+            raw = raw[:997] + "..."
+        embed.add_field(name="Payload", value=f"```json\n{raw}\n```", inline=False)
+
+        channel_id = CONFIG.roblox_audit_log_channel_id or CONFIG.command_log_channel_id
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel:
+            await channel.send(embed=embed)
+        return web.json_response({"ok": True})
+
+    async def fetch_weekly_minutes(self, conn: asyncpg.Connection, discord_id: int, wk: str | None = None) -> int:
+        wk = wk or week_key()
+        value = await conn.fetchval(
+            "SELECT COALESCE(SUM(minutes), 0)::INT FROM roblox_activity WHERE discord_id=$1 AND week_key=$2",
+            discord_id,
+            wk,
+        )
+        return int(value or 0)
+
+    async def fetch_all_time_minutes(self, conn: asyncpg.Connection, discord_id: int) -> int:
+        value = await conn.fetchval(
+            "SELECT COALESCE(SUM(minutes), 0)::INT FROM roblox_activity WHERE discord_id=$1",
+            discord_id,
+        )
+        return int(value or 0)
+
+    async def active_strike_count(self, conn: asyncpg.Connection, discord_id: int) -> int:
+        value = await conn.fetchval(
+            "SELECT COUNT(*)::INT FROM strikes WHERE member_id=$1 AND active=TRUE AND expires_at>$2",
+            discord_id,
+            utcnow(),
+        )
+        return int(value or 0)
+
+    def find_member(self, discord_id: int) -> discord.Member | None:
+        for guild in self.guilds:
+            member = guild.get_member(discord_id)
+            if member:
+                return member
+        return None
+
+    async def send_activity_log(self, title: str, description: str, color: discord.Color) -> None:
+        channel = self.get_channel(CONFIG.activity_log_channel_id) if CONFIG.activity_log_channel_id else None
+        if not channel:
+            return
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=utcnow())
+        embed.set_footer(text=CONFIG.department_name)
+        await channel.send(embed=embed)
+
+    async def log_command(self, title: str, description: str, color: discord.Color | None = None) -> None:
+        channel = self.get_channel(CONFIG.command_log_channel_id) if CONFIG.command_log_channel_id else None
+        if not channel:
+            print(f"[LOG] {title}: {description}")
+            return
+        embed = discord.Embed(
+            title=title,
+            description=description[:4000],
+            color=color or discord.Color.dark_gray(),
+            timestamp=utcnow(),
+        )
+        embed.set_footer(text=CONFIG.department_name)
+        await channel.send(embed=embed)
+
+    async def get_verified_roblox(self, discord_id: int) -> asyncpg.Record | None:
+        if not self.db_pool:
+            return None
+        async with self.db_pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT roblox_id, roblox_username FROM roblox_verification WHERE discord_id=$1",
+                discord_id,
+            )
+
+
+bot = ECBot()
+
+
+# ============================================================
+# Permission checks
+# ============================================================
+
+def member_has_role(member: discord.Member, role_id: int | None) -> bool:
+    if role_id is None:
+        return False
+    return any(role.id == role_id for role in member.roles)
+
+
+def is_management(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator or member_has_role(member, CONFIG.management_role_id)
+
+
+def can_manage_activity(member: discord.Member) -> bool:
+    return is_management(member) or member_has_role(member, CONFIG.activity_manager_role_id)
+
+
+def can_manage_strikes(member: discord.Member) -> bool:
+    return is_management(member) or member_has_role(member, CONFIG.strike_manager_role_id)
+
+
+def can_manage_ranks(member: discord.Member) -> bool:
+    return is_management(member) or member_has_role(member, CONFIG.rank_manager_role_id)
+
+
+def can_send_welcome(member: discord.Member) -> bool:
+    return is_management(member) or member_has_role(member, CONFIG.welcome_manager_role_id)
+
+
+async def require_db(interaction: discord.Interaction) -> bool:
+    if bot.db_pool:
+        return True
+    await interaction.response.send_message("Database is not connected. Check Railway/Postgres configuration.", ephemeral=True)
+    return False
+
+
+# ============================================================
+# Events
+# ============================================================
+
+@bot.event
+async def on_ready() -> None:
+    print(f"[READY] Logged in as {bot.user}.")
+    if CONFIG.auto_weekly_report or CONFIG.auto_weekly_reset:
+        weekly_scheduler.start()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    await bot.log_command(
+        "Slash Command Error",
+        f"Command: `/{getattr(interaction.command, 'qualified_name', 'unknown')}`\nError: `{error}`",
+        discord.Color.red(),
+    )
+    if not interaction.response.is_done():
+        await interaction.response.send_message("Something went wrong running that command.", ephemeral=True)
+
+
+# ============================================================
+# Roblox helpers
+# ============================================================
+
+async def lookup_roblox_user(username: str) -> tuple[int, str] | None:
+    payload = {"usernames": [username], "excludeBannedUsers": True}
+    async with aiohttp.ClientSession() as session:
+        async with session.post("https://users.roblox.com/v1/usernames/users", json=payload, timeout=20) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+    results = data.get("data") or []
+    if not results:
+        return None
+    return int(results[0]["id"]), str(results[0]["name"])
+
+
+async def fetch_group_ranks() -> list[dict[str, Any]]:
+    if not CONFIG.roblox_service_base or not CONFIG.roblox_service_secret:
+        return []
+    url = f"{CONFIG.roblox_service_base}/ranks"
+    headers = {"X-Secret-Key": CONFIG.roblox_service_secret}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=20) as resp:
+            text = await resp.text()
+            if resp.status // 100 != 2:
+                raise RuntimeError(f"Rank service /ranks failed {resp.status}: {text}")
+            data = json.loads(text)
+    return data.get("roles", []) or []
+
+
+async def set_group_rank(roblox_id: int, rank_name: str) -> str:
+    if not CONFIG.roblox_service_base or not CONFIG.roblox_service_secret:
+        raise RuntimeError("ROBLOX_SERVICE_BASE and ROBLOX_SERVICE_SECRET are required for ranking.")
+
+    roles = await fetch_group_ranks()
+    requested = rank_name.strip().lower()
+    target = None
+    for role in roles:
+        name = str(role.get("name") or "")
+        if name.lower() == requested:
+            target = role
+            break
+    if not target:
+        available = ", ".join(str(r.get("name")) for r in roles[:20] if r.get("name")) or "No ranks returned"
+        raise RuntimeError(f"Rank `{rank_name}` was not found. Available examples: {available}")
+
+    body: dict[str, Any] = {"robloxId": int(roblox_id), "groupId": int(CONFIG.roblox_group_id)}
+    role_id = target.get("roleId") if target.get("roleId") is not None else target.get("id")
+    rank_number = target.get("rank") if target.get("rank") is not None else target.get("rankNumber")
+    if role_id is not None:
+        body["roleId"] = int(role_id)
+    elif rank_number is not None:
+        body["rankNumber"] = int(rank_number)
+    else:
+        raise RuntimeError(f"Rank service did not return a roleId or rank number for `{rank_name}`.")
+
+    url = f"{CONFIG.roblox_service_base}/set-rank"
+    headers = {"X-Secret-Key": CONFIG.roblox_service_secret, "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body, timeout=25) as resp:
+            text = await resp.text()
+            if resp.status // 100 != 2:
+                raise RuntimeError(f"Rank service /set-rank failed {resp.status}: {text}")
+    return str(target.get("name") or rank_name)
+
+
+async def rank_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    del interaction
+    try:
+        roles = await fetch_group_ranks()
+    except Exception:
+        roles = []
+    current_lower = current.lower().strip()
+    names = [str(role.get("name")) for role in roles if role.get("name")]
+    if current_lower:
+        names = [name for name in names if current_lower in name.lower()]
+    return [app_commands.Choice(name=name[:100], value=name[:100]) for name in names[:25]]
+
+
+# ============================================================
+# /verify
+# ============================================================
+
+@bot.tree.command(name="verify", description="Link your Discord account to your Roblox account.")
+@app_commands.describe(roblox_username="Your exact Roblox username")
+async def verify(interaction: discord.Interaction, roblox_username: str) -> None:
+    if not await require_db(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await lookup_roblox_user(roblox_username)
+    if not result:
+        await interaction.followup.send("I could not find that Roblox username.", ephemeral=True)
+        return
+    roblox_id, roblox_name = result
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO roblox_verification (discord_id, roblox_id, roblox_username, verified_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET roblox_id=EXCLUDED.roblox_id, roblox_username=EXCLUDED.roblox_username, verified_at=EXCLUDED.verified_at
+            """,
+            interaction.user.id,
+            roblox_id,
+            roblox_name,
+            utcnow(),
+        )
+    await bot.log_command(
+        "Verification Linked",
+        f"User: {interaction.user.mention}\nRoblox: **{roblox_name}** (`{roblox_id}`)",
+        CONFIG.department_color,
+    )
+    await interaction.followup.send(f"Successfully verified as **{roblox_name}**.", ephemeral=True)
+
+
+# ============================================================
+# /activity commands
+# ============================================================
+
+def activity_status(minutes: int) -> str:
+    if minutes >= CONFIG.weekly_time_requirement:
+        return "✅ Met Requirement"
+    if minutes > 0:
+        return "❌ Below Requirement"
+    return "🚫 No Activity"
+
+
+async def build_activity_report(guild: discord.Guild, wk: str | None = None) -> tuple[discord.Embed, dict[str, Any]]:
+    wk = wk or week_key()
+    assert bot.db_pool is not None
+    async with bot.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT discord_id, COALESCE(SUM(minutes), 0)::INT AS minutes FROM roblox_activity WHERE week_key=$1 GROUP BY discord_id",
+            wk,
+        )
+
+    minute_map = {int(row["discord_id"]): int(row["minutes"] or 0) for row in rows}
+
+    # Include department role members so no-activity people appear, if configured.
+    member_ids: set[int] = set(minute_map.keys())
+    if CONFIG.department_role_id:
+        role = guild.get_role(CONFIG.department_role_id)
+        if role:
+            member_ids.update(member.id for member in role.members if not member.bot)
+
+    met: list[str] = []
+    below: list[str] = []
+    none: list[str] = []
+    records = []
+    for member_id in sorted(member_ids):
+        member = guild.get_member(member_id)
+        name = member.display_name if member else f"Unknown ({member_id})"
+        minutes = minute_map.get(member_id, 0)
+        line = f"**{name}** — {fmt_minutes(minutes)}/{fmt_minutes(CONFIG.weekly_time_requirement)}"
+        records.append({"discord_id": member_id, "name": name, "minutes": minutes})
+        if minutes >= CONFIG.weekly_time_requirement:
+            met.append(line)
+        elif minutes > 0:
+            below.append(line)
+        else:
+            none.append(line)
+
+    def block(lines: list[str]) -> str:
+        return "\n".join(lines[:30]) if lines else "—"
+
+    embed = discord.Embed(
+        title=f"{CONFIG.department_name} Weekly Activity Report",
+        description=f"Week: **{wk}**\nRequirement: **{fmt_minutes(CONFIG.weekly_time_requirement)}**",
+        color=CONFIG.department_color,
+        timestamp=utcnow(),
+    )
+    embed.add_field(name=f"✅ Met Requirement ({len(met)})", value=block(met), inline=False)
+    embed.add_field(name=f"❌ Below Requirement ({len(below)})", value=block(below), inline=False)
+    embed.add_field(name=f"🚫 No Activity ({len(none)})", value=block(none), inline=False)
+    embed.set_footer(text=CONFIG.department_name)
+
+    snapshot = {"week_key": wk, "requirement_minutes": CONFIG.weekly_time_requirement, "records": records}
+    return embed, snapshot
+
+
+@activity_group.command(name="me", description="View your weekly activity.")
+async def activity_me(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    async with bot.db_pool.acquire() as conn:
+        weekly = await bot.fetch_weekly_minutes(conn, interaction.user.id)
+        all_time = await bot.fetch_all_time_minutes(conn, interaction.user.id)
+        strikes = await bot.active_strike_count(conn, interaction.user.id)
+    embed = discord.Embed(title="Your Activity", color=CONFIG.department_color, timestamp=utcnow())
+    embed.add_field(name="This Week", value=f"{fmt_minutes(weekly)}/{fmt_minutes(CONFIG.weekly_time_requirement)}", inline=True)
+    embed.add_field(name="Status", value=activity_status(weekly), inline=True)
+    embed.add_field(name="All-Time", value=fmt_minutes(all_time), inline=True)
+    embed.add_field(name="Active Strikes", value=f"{strikes}/{CONFIG.max_strikes}", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@activity_group.command(name="member", description="View a member's activity.")
+@app_commands.describe(member="Member to check")
+async def activity_member(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not await require_db(interaction):
+        return
+    if member.id != interaction.user.id and not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to view other members' activity.", ephemeral=True)
+        return
+    async with bot.db_pool.acquire() as conn:
+        weekly = await bot.fetch_weekly_minutes(conn, member.id)
+        all_time = await bot.fetch_all_time_minutes(conn, member.id)
+        strikes = await bot.active_strike_count(conn, member.id)
+        verified = await conn.fetchrow("SELECT roblox_username, roblox_id FROM roblox_verification WHERE discord_id=$1", member.id)
+    embed = discord.Embed(title=f"Activity for {member.display_name}", color=CONFIG.department_color, timestamp=utcnow())
+    embed.add_field(name="This Week", value=f"{fmt_minutes(weekly)}/{fmt_minutes(CONFIG.weekly_time_requirement)}", inline=True)
+    embed.add_field(name="Status", value=activity_status(weekly), inline=True)
+    embed.add_field(name="All-Time", value=fmt_minutes(all_time), inline=True)
+    embed.add_field(name="Active Strikes", value=f"{strikes}/{CONFIG.max_strikes}", inline=True)
+    if verified:
+        embed.add_field(name="Roblox", value=f"{verified['roblox_username']} (`{verified['roblox_id']}`)", inline=False)
+    else:
+        embed.add_field(name="Roblox", value="Not verified", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@activity_group.command(name="leaderboard", description="Show the weekly activity leaderboard.")
+async def activity_leaderboard(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    async with bot.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT discord_id, COALESCE(SUM(minutes), 0)::INT AS minutes
+            FROM roblox_activity
+            WHERE week_key=$1
+            GROUP BY discord_id
+            ORDER BY minutes DESC
+            LIMIT 10
+            """,
+            week_key(),
+        )
+    if not rows:
+        await interaction.response.send_message("No activity has been tracked this week.", ephemeral=True)
+        return
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+    for idx, row in enumerate(rows, start=1):
+        member = interaction.guild.get_member(int(row["discord_id"])) if interaction.guild else None
+        name = member.display_name if member else f"Unknown ({row['discord_id']})"
+        prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+        lines.append(f"{prefix} **{name}** — {fmt_minutes(int(row['minutes']))}")
+    embed = discord.Embed(
+        title=f"🏆 {CONFIG.department_abbrev} Weekly Activity Leaderboard",
+        description="\n".join(lines),
+        color=CONFIG.department_color,
+        timestamp=utcnow(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@activity_group.command(name="add", description="(Mgmt) Manually add activity time to a member.")
+@app_commands.describe(member="Member to credit", minutes="Minutes to add", reason="Reason for the adjustment")
+async def activity_add(interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 10000], reason: str) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to adjust activity.", ephemeral=True)
+        return
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO roblox_activity (discord_id, roblox_id, week_key, minutes, source, reason) VALUES ($1, NULL, $2, $3, 'manual_add', $4)",
+            member.id,
+            week_key(),
+            int(minutes),
+            reason,
+        )
+        await conn.execute(
+            "INSERT INTO activity_adjustments (discord_id, minutes_delta, reason, adjusted_by) VALUES ($1, $2, $3, $4)",
+            member.id,
+            int(minutes),
+            reason,
+            interaction.user.id,
+        )
+        weekly = await bot.fetch_weekly_minutes(conn, member.id)
+    await bot.log_command(
+        "Activity Added",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nAdded: **{fmt_minutes(minutes)}**\nReason: {reason}\nNew weekly total: **{fmt_minutes(weekly)}**",
+        CONFIG.department_color,
+    )
+    await interaction.response.send_message(f"Added **{fmt_minutes(minutes)}** to {member.mention}. New weekly total: **{fmt_minutes(weekly)}**.", ephemeral=True)
+
+
+@activity_group.command(name="remove", description="(Mgmt) Manually remove activity time from a member.")
+@app_commands.describe(member="Member to adjust", minutes="Minutes to remove", reason="Reason for the adjustment")
+async def activity_remove(interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 10000], reason: str) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to adjust activity.", ephemeral=True)
+        return
+    delta = -int(minutes)
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO roblox_activity (discord_id, roblox_id, week_key, minutes, source, reason) VALUES ($1, NULL, $2, $3, 'manual_remove', $4)",
+            member.id,
+            week_key(),
+            delta,
+            reason,
+        )
+        await conn.execute(
+            "INSERT INTO activity_adjustments (discord_id, minutes_delta, reason, adjusted_by) VALUES ($1, $2, $3, $4)",
+            member.id,
+            delta,
+            reason,
+            interaction.user.id,
+        )
+        weekly = await bot.fetch_weekly_minutes(conn, member.id)
+    await bot.log_command(
+        "Activity Removed",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nRemoved: **{fmt_minutes(minutes)}**\nReason: {reason}\nNew weekly total: **{fmt_minutes(max(weekly, 0))}**",
+        discord.Color.orange(),
+    )
+    await interaction.response.send_message(f"Removed **{fmt_minutes(minutes)}** from {member.mention}. New weekly total: **{fmt_minutes(max(weekly, 0))}**.", ephemeral=True)
+
+
+@activity_group.command(name="weekly_preview", description="(Mgmt) Preview the weekly activity report.")
+async def activity_weekly_preview(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to preview weekly reports.", ephemeral=True)
+        return
+    embed, _ = await build_activity_report(interaction.guild)
+    embed.title += " (Preview)"
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@activity_group.command(name="report", description="(Mgmt) Post the weekly activity report.")
+async def activity_report(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to post weekly reports.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    embed, snapshot = await build_activity_report(interaction.guild)
+    channel = bot.get_channel(CONFIG.weekly_report_channel_id) if CONFIG.weekly_report_channel_id else interaction.channel
+    await channel.send(embed=embed)
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO weekly_snapshots (week_key, report_json, created_by) VALUES ($1, $2, $3)",
+            week_key(),
+            json.dumps(snapshot),
+            interaction.user.id,
+        )
+    await bot.log_command("Weekly Activity Report Posted", f"By: {interaction.user.mention}\nWeek: **{week_key()}**", CONFIG.department_color)
+    await interaction.followup.send("Weekly activity report posted.", ephemeral=True)
+
+
+@activity_group.command(name="reset", description="(Mgmt) Reset this week's activity totals.")
+async def activity_reset(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to reset activity.", ephemeral=True)
+        return
+    wk = week_key()
+    async with bot.db_pool.acquire() as conn:
+        deleted = await conn.execute("DELETE FROM roblox_activity WHERE week_key=$1", wk)
+        await conn.execute("DELETE FROM roblox_sessions")
+    await bot.log_command("Weekly Activity Reset", f"By: {interaction.user.mention}\nWeek reset: **{wk}**\nResult: `{deleted}`", discord.Color.orange())
+    await interaction.response.send_message(f"Weekly activity for **{wk}** has been reset.", ephemeral=True)
+
+
+# ============================================================
+# /strikes commands
+# ============================================================
+
+@strikes_group.command(name="add", description="(Mgmt) Add a strike to a member.")
+@app_commands.describe(member="Member receiving the strike", reason="Reason for the strike", duration_days="How long the strike lasts")
+async def strikes_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+    duration_days: app_commands.Range[int, 1, 365] | None = None,
+) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_strikes(interaction.user):
+        await interaction.response.send_message("You do not have permission to manage strikes.", ephemeral=True)
+        return
+    days = int(duration_days or CONFIG.default_strike_duration_days)
+    expires = utcnow() + dt.timedelta(days=days)
+    async with bot.db_pool.acquire() as conn:
+        strike_id = await conn.fetchval(
+            """
+            INSERT INTO strikes (member_id, reason, issued_by, issued_at, expires_at, active, auto)
+            VALUES ($1, $2, $3, $4, $5, TRUE, FALSE)
+            RETURNING strike_id
+            """,
+            member.id,
+            reason,
+            interaction.user.id,
+            utcnow(),
+            expires,
+        )
+        active = await bot.active_strike_count(conn, member.id)
+    await bot.log_command(
+        "Strike Added",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nStrike ID: `{strike_id}`\nActive strikes: **{active}/{CONFIG.max_strikes}**\nExpires: <t:{int(expires.timestamp())}:F>\nReason: {reason}",
+        discord.Color.red(),
+    )
+    await interaction.response.send_message(f"Strike `{strike_id}` added to {member.mention}. Active strikes: **{active}/{CONFIG.max_strikes}**.", ephemeral=True)
+
+
+@strikes_group.command(name="view", description="View active strikes for a member.")
+@app_commands.describe(member="Member to check")
+async def strikes_view(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+    if not await require_db(interaction):
+        return
+    target = member or interaction.user
+    if target.id != interaction.user.id and not can_manage_strikes(interaction.user):
+        await interaction.response.send_message("You do not have permission to view other members' strikes.", ephemeral=True)
+        return
+    async with bot.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT strike_id, reason, issued_by, issued_at, expires_at, auto
+            FROM strikes
+            WHERE member_id=$1 AND active=TRUE AND expires_at>$2
+            ORDER BY issued_at DESC
+            """,
+            target.id,
+            utcnow(),
+        )
+    if not rows:
+        await interaction.response.send_message(f"{target.display_name} has no active strikes.", ephemeral=True)
+        return
+    lines = []
+    for row in rows:
+        issuer = f"<@{row['issued_by']}>" if row["issued_by"] else "System"
+        auto_text = "Auto" if row["auto"] else "Manual"
+        lines.append(
+            f"**ID `{row['strike_id']}`** — {auto_text}\n"
+            f"Reason: {row['reason']}\n"
+            f"Issued by: {issuer}\n"
+            f"Expires: <t:{int(row['expires_at'].timestamp())}:R>"
+        )
+    embed = discord.Embed(title=f"Active Strikes for {target.display_name}", description="\n\n".join(lines), color=discord.Color.red(), timestamp=utcnow())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@strikes_group.command(name="remove", description="(Mgmt) Remove a strike by ID.")
+@app_commands.describe(strike_id="The strike ID", reason="Reason for removing the strike")
+async def strikes_remove(interaction: discord.Interaction, strike_id: int, reason: str) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_strikes(interaction.user):
+        await interaction.response.send_message("You do not have permission to manage strikes.", ephemeral=True)
+        return
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT member_id, active FROM strikes WHERE strike_id=$1", strike_id)
+        if not row:
+            await interaction.response.send_message("That strike ID does not exist.", ephemeral=True)
+            return
+        if not row["active"]:
+            await interaction.response.send_message("That strike is already inactive.", ephemeral=True)
+            return
+        await conn.execute(
+            """
+            UPDATE strikes
+            SET active=FALSE, removed_by=$1, removed_reason=$2, removed_at=$3
+            WHERE strike_id=$4
+            """,
+            interaction.user.id,
+            reason,
+            utcnow(),
+            strike_id,
+        )
+    await bot.log_command(
+        "Strike Removed",
+        f"By: {interaction.user.mention}\nStrike ID: `{strike_id}`\nMember: <@{row['member_id']}>\nReason: {reason}",
+        CONFIG.department_color,
+    )
+    await interaction.response.send_message(f"Strike `{strike_id}` has been removed.", ephemeral=True)
+
+
+@strikes_group.command(name="clear", description="(Mgmt) Clear all active strikes from a member.")
+@app_commands.describe(member="Member whose active strikes should be cleared", reason="Reason for clearing strikes")
+async def strikes_clear(interaction: discord.Interaction, member: discord.Member, reason: str) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_strikes(interaction.user):
+        await interaction.response.send_message("You do not have permission to manage strikes.", ephemeral=True)
+        return
+    async with bot.db_pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE strikes
+            SET active=FALSE, removed_by=$1, removed_reason=$2, removed_at=$3
+            WHERE member_id=$4 AND active=TRUE AND expires_at>$5
+            """,
+            interaction.user.id,
+            reason,
+            utcnow(),
+            member.id,
+            utcnow(),
+        )
+    await bot.log_command(
+        "Strikes Cleared",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nResult: `{result}`\nReason: {reason}",
+        CONFIG.department_color,
+    )
+    await interaction.response.send_message(f"Active strikes cleared for {member.mention}.", ephemeral=True)
+
+
+# ============================================================
+# /rank and /welcome
+# ============================================================
+
+@bot.tree.command(name="rank", description="(Mgmt) Change a verified member's Roblox group rank.")
+@app_commands.autocomplete(rank=rank_autocomplete)
+@app_commands.describe(member="Discord member to rank", rank="Exact Roblox group rank name")
+async def rank_member(interaction: discord.Interaction, member: discord.Member, rank: str) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_ranks(interaction.user):
+        await interaction.response.send_message("You do not have permission to manage ranks.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    verified = await bot.get_verified_roblox(member.id)
+    if not verified:
+        await interaction.followup.send("That member has not verified their Roblox account yet.", ephemeral=True)
+        return
+    try:
+        final_rank = await set_group_rank(int(verified["roblox_id"]), rank)
+    except Exception as exc:
+        await interaction.followup.send(f"Ranking failed: `{exc}`", ephemeral=True)
+        await bot.log_command("Rank Update Failed", f"By: {interaction.user.mention}\nMember: {member.mention}\nRank: `{rank}`\nError: `{exc}`", discord.Color.red())
+        return
+
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO member_ranks (discord_id, rank_name, set_by, set_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET rank_name=EXCLUDED.rank_name, set_by=EXCLUDED.set_by, set_at=EXCLUDED.set_at
+            """,
+            member.id,
+            final_rank,
+            interaction.user.id,
+            utcnow(),
+        )
+    await bot.log_command(
+        "Rank Updated",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nRoblox: **{verified['roblox_username']}** (`{verified['roblox_id']}`)\nNew Rank: **{final_rank}**",
+        CONFIG.department_color,
+    )
+    await interaction.followup.send(f"Updated {member.mention}'s Roblox rank to **{final_rank}**.", ephemeral=True)
+
+
+@bot.tree.command(name="welcome", description="(Mgmt) Send the configurable welcome message for a member.")
+@app_commands.describe(member="Member to welcome", channel="Optional channel to send the welcome message in")
+async def welcome(interaction: discord.Interaction, member: discord.Member, channel: discord.TextChannel | None = None) -> None:
+    if not can_send_welcome(interaction.user):
+        await interaction.response.send_message("You do not have permission to send welcome messages.", ephemeral=True)
+        return
+    target = channel or (bot.get_channel(CONFIG.welcome_channel_id) if CONFIG.welcome_channel_id else interaction.channel)
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message("I could not find a valid welcome channel.", ephemeral=True)
+        return
+    message = CONFIG.welcome_message.format(
+        member=member.mention,
+        member_name=member.display_name,
+        department=CONFIG.department_name,
+        abbreviation=CONFIG.department_abbrev,
+        group_url=CONFIG.department_group_url,
+    )
+    embed = discord.Embed(title=CONFIG.welcome_title, description=message, color=CONFIG.department_color, timestamp=utcnow())
+    embed.set_footer(text=CONFIG.department_name)
+    await target.send(content=member.mention, embed=embed)
+    await bot.log_command("Welcome Sent", f"By: {interaction.user.mention}\nMember: {member.mention}\nChannel: {target.mention}", CONFIG.department_color)
+    await interaction.response.send_message(f"Welcome message sent in {target.mention}.", ephemeral=True)
+
+
+# ============================================================
+# Optional weekly scheduler
+# ============================================================
+
+@tasks.loop(minutes=30)
+async def weekly_scheduler() -> None:
+    if not bot.db_pool or not CONFIG.auto_weekly_report and not CONFIG.auto_weekly_reset:
+        return
+    now = utcnow()
+    if now.weekday() != CONFIG.auto_report_weekday_utc or now.hour != CONFIG.auto_report_hour_utc:
+        return
+    # Guard: only run once per configured hour by writing a snapshot marker.
+    marker_week = week_key(now)
+    async with bot.db_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT 1 FROM weekly_snapshots WHERE week_key=$1 AND report_json->>'auto_marker'='true'",
+            marker_week,
+        )
+        if existing:
+            return
+    for guild in bot.guilds:
+        channel = bot.get_channel(CONFIG.weekly_report_channel_id) if CONFIG.weekly_report_channel_id else None
+        if CONFIG.auto_weekly_report and channel:
+            embed, snapshot = await build_activity_report(guild, marker_week)
+            await channel.send(embed=embed)
+            async with bot.db_pool.acquire() as conn:
+                snapshot["auto_marker"] = "true"
+                await conn.execute(
+                    "INSERT INTO weekly_snapshots (week_key, report_json, created_by) VALUES ($1, $2, NULL)",
+                    marker_week,
+                    json.dumps(snapshot),
+                )
+            await bot.log_command("Auto Weekly Report Posted", f"Week: **{marker_week}**", CONFIG.department_color)
+        if CONFIG.auto_weekly_reset:
+            async with bot.db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM roblox_activity WHERE week_key=$1", marker_week)
+                await conn.execute("DELETE FROM roblox_sessions")
+            await bot.log_command("Auto Weekly Activity Reset", f"Week: **{marker_week}**", discord.Color.orange())
+
+
+# ============================================================
+# Entrypoint
+# ============================================================
+
+if __name__ == "__main__":
+    if not CONFIG.bot_token:
+        raise RuntimeError("Missing BOT_TOKEN in environment.")
+    bot.run(CONFIG.bot_token)
