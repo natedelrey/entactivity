@@ -1,5 +1,5 @@
 """
-Ethics Committee Operations Bot
+Engineering and Technical Service Operations Bot
 - Discord slash commands
 - Roblox verification
 - Roblox activity webhooks
@@ -108,13 +108,17 @@ class BotConfig:
     port: int = getenv_int("PORT", 8080) or 8080
 
     # Department branding
-    department_name: str = getenv_str("DEPARTMENT_NAME", "Ethics Committee") or "Ethics Committee"
-    department_abbrev: str = getenv_str("DEPARTMENT_ABBREVIATION", "EC") or "EC"
-    department_color: discord.Color = getenv_color("DEPARTMENT_COLOR", "2A3825")
+    department_name: str = getenv_str("DEPARTMENT_NAME", "Engineering and Technical Service") or "Engineering and Technical Service"
+    department_abbrev: str = getenv_str("DEPARTMENT_ABBREVIATION", "E&T") or "E&T"
+    department_color: discord.Color = getenv_color("DEPARTMENT_COLOR", "2F6F8F")
     department_group_url: str = getenv_str(
         "DEPARTMENT_GROUP_URL",
-        "https://www.roblox.com/communities/34438615/",
-    ) or "https://www.roblox.com/communities/34438615/"
+        "https://www.roblox.com/communities/515594004/SCPF-Engineering-and-Technical-Service#!/about",
+    ) or "https://www.roblox.com/communities/515594004/SCPF-Engineering-and-Technical-Service#!/about"
+    department_description: str = getenv_str(
+        "DEPARTMENT_DESCRIPTION",
+        "The Engineering and Technical Service Department (E&T) is responsible for the upkeep and maintenance of the facility. Whether it’s repairing a door or making changes to an SCP's containment zone, E&T is vital to ensuring smooth operations can persist within the facility.",
+    ) or "The Engineering and Technical Service Department (E&T) is responsible for the upkeep and maintenance of the facility. Whether it’s repairing a door or making changes to an SCP's containment zone, E&T is vital to ensuring smooth operations can persist within the facility."
 
     # Discord channels
     activity_log_channel_id: int | None = getenv_int("ACTIVITY_LOG_CHANNEL_ID")
@@ -133,7 +137,7 @@ class BotConfig:
 
     # Roblox service/webhooks
     api_secret_key: str | None = getenv_str("API_SECRET_KEY")
-    roblox_group_id: int = getenv_int("ROBLOX_GROUP_ID", 34438615) or 34438615
+    roblox_group_id: int = getenv_int("ROBLOX_GROUP_ID", 515594004) or 515594004
     roblox_service_base: str | None = normalize_base_url(getenv_str("ROBLOX_SERVICE_BASE"))
     roblox_service_secret: str | None = getenv_str("ROBLOX_SERVICE_SECRET")
 
@@ -150,11 +154,11 @@ class BotConfig:
     max_strikes: int = getenv_int("MAX_STRIKES", 3) or 3
 
     # Welcome
-    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to the Ethics Committee") or "Welcome to the Ethics Committee"
+    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to Engineering and Technical Service") or "Welcome to Engineering and Technical Service"
     welcome_message: str = getenv_str(
         "WELCOME_MESSAGE",
-        "Welcome {member} to the Ethics Committee! Please verify with `/verify`, review the handbook, and stay active on-site.",
-    ) or "Welcome {member} to the Ethics Committee! Please verify with `/verify`, review the handbook, and stay active on-site."
+        "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}",
+    ) or "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}"
 
 
 CONFIG = BotConfig()
@@ -177,7 +181,7 @@ def is_default_role(role: discord.Role) -> bool:
     return role.is_default() or role.id == role.guild.id
 
 
-class ECBot(commands.Bot):
+class ETBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.db_pool: asyncpg.Pool | None = None
@@ -511,7 +515,7 @@ class ECBot(commands.Bot):
             )
 
 
-bot = ECBot()
+bot = ETBot()
 
 
 # ============================================================
@@ -1148,6 +1152,7 @@ async def welcome(interaction: discord.Interaction, member: discord.Member, chan
         department=CONFIG.department_name,
         abbreviation=CONFIG.department_abbrev,
         group_url=CONFIG.department_group_url,
+        description=CONFIG.department_description,
     )
     embed = discord.Embed(title=CONFIG.welcome_title, description=message, color=CONFIG.department_color, timestamp=utcnow())
     embed.set_footer(text=CONFIG.department_name)

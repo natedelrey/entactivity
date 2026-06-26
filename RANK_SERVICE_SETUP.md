@@ -15,7 +15,7 @@ python roblox_rank_service.py
 
 - `ROBLOX_SERVICE_SECRET` = shared secret used by your Discord bot.
 - `ROBLOX_OPENCLOUD_API_KEY` = Roblox Open Cloud API key with permissions to list group roles and assign member roles.
-- `ROBLOX_GROUP_ID` = your group id (defaults to `34438615`).
+- `ROBLOX_GROUP_ID` = your group id (defaults to `515594004`).
 - `PORT` = service port (default `8080`).
 
 ## 3) Set environment variables on the Discord bot
@@ -36,5 +36,5 @@ Set rank (replace ids):
 curl -X POST "$ROBLOX_SERVICE_BASE/set-rank" \
   -H "X-Secret-Key: $ROBLOX_SERVICE_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"robloxId":123456,"groupId":34438615,"roleId":9876543}'
+  -d '{"robloxId":123456,"groupId":515594004,"roleId":9876543}'
 ```
