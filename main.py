@@ -123,31 +123,11 @@ WELCOME_MESSAGE_DEFAULT = (
 )
 
 
-def has_legacy_welcome_content(value: str) -> bool:
-    normalized = value.replace("\\n", "\n")
-    return (
-        normalized == LEGACY_WELCOME_MESSAGE
-        or "{description}" in normalized
-        or "{group_url}" in normalized
-        or "Group:" in normalized
-    )
-
-
 def getenv_upgraded(name: str, default: str, legacy_value: str | None = None) -> str:
     value = getenv_str(name)
-    if value is None:
+    if value is None or value == legacy_value:
         return default
-    normalized = value.replace("\\n", "\n")
-    if value == legacy_value or normalized == legacy_value:
-        return default
-    return normalized
-
-
-def getenv_welcome_message() -> str:
-    value = getenv_str("WELCOME_MESSAGE")
-    if value is None or has_legacy_welcome_content(value):
-        return WELCOME_MESSAGE_DEFAULT
-    return value.replace("\\n", "\n")
+    return value
 
 
 @dataclass(frozen=True)
@@ -204,11 +184,26 @@ class BotConfig:
     max_strikes: int = getenv_int("MAX_STRIKES", 3) or 3
 
     # Welcome
-    welcome_title: str = getenv_upgraded("WELCOME_TITLE", WELCOME_TITLE_DEFAULT, LEGACY_WELCOME_TITLE)
-    welcome_department_display: str = getenv_str("WELCOME_DEPARTMENT_DISPLAY", WELCOME_DEPARTMENT_DISPLAY_DEFAULT) or WELCOME_DEPARTMENT_DISPLAY_DEFAULT
-    welcome_guidelines_channel: str = getenv_str("WELCOME_GUIDELINES_CHANNEL", WELCOME_GUIDELINES_CHANNEL_DEFAULT) or WELCOME_GUIDELINES_CHANNEL_DEFAULT
-    welcome_internship_url: str = getenv_str("WELCOME_INTERNSHIP_URL", WELCOME_INTERNSHIP_URL_DEFAULT) or WELCOME_INTERNSHIP_URL_DEFAULT
-    welcome_message: str = getenv_welcome_message()
+    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to Engineering & Technical Service") or "Welcome to Engineering & Technical Service"
+    welcome_department_display: str = getenv_str("WELCOME_DEPARTMENT_DISPLAY", "Engineering & Technical Service") or "Engineering & Technical Service"
+    welcome_guidelines_channel: str = getenv_str("WELCOME_GUIDELINES_CHANNEL", "<#1520160137132773376>") or "<#1520160137132773376>"
+    welcome_internship_url: str = getenv_str(
+        "WELCOME_INTERNSHIP_URL",
+        "https://trello.com/c/NqgrPAJF/6-internship-program",
+    ) or "https://trello.com/c/NqgrPAJF/6-internship-program"
+    welcome_message: str = getenv_str(
+        "WELCOME_MESSAGE",
+        "Welcome, {member}, to **{welcome_department}!** ({abbreviation})\n\n"
+        "We’re glad to have you join the department. Before getting started, please make sure you complete the following:\n\n"
+        "**1. Run `/verify` with this bot.**\n\n"
+        "This is required so your activity, logs, and department progress can be properly tracked.\n\n"
+        "**2. Read the Department Guidelines**\n"
+        "Please review our full guidelines which can be found in {guidelines_channel}. These explain department expectations, logging rules, task validity, conduct, and other important information you are expected to follow.\n\n"
+        "**3. Complete the Internship Program**\n"
+        "All new members begin as **Trainee Technicians** and are required to complete the [Internship Program]({internship_url}) within **2 weeks** of joining.\n\n"
+        "The Internship Program card contains the full requirements, expectations, and information needed to rank up to **Junior Technician** and become a full member of the department.\n\n"
+        "Please read everything carefully, ask management if you have any questions, and good luck in {abbreviation}!",
+    ) or "Welcome, {member}, to **{welcome_department}!** ({abbreviation})"
 
 
 CONFIG = BotConfig()
