@@ -100,6 +100,36 @@ def normalize_base_url(url: str | None) -> str | None:
     return clean
 
 
+LEGACY_WELCOME_TITLE = "Welcome to Engineering and Technical Service"
+WELCOME_TITLE_DEFAULT = "Welcome to Engineering & Technical Service"
+WELCOME_DEPARTMENT_DISPLAY_DEFAULT = "Engineering & Technical Service"
+WELCOME_GUIDELINES_CHANNEL_DEFAULT = "<#1520160137132773376>"
+WELCOME_INTERNSHIP_URL_DEFAULT = "https://trello.com/c/NqgrPAJF/6-internship-program"
+LEGACY_WELCOME_MESSAGE = (
+    "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, "
+    "review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}"
+)
+WELCOME_MESSAGE_DEFAULT = (
+    "Welcome, {member}, to **{welcome_department}!** ({abbreviation})\n\n"
+    "We’re glad to have you join the department. Before getting started, please make sure you complete the following:\n\n"
+    "**1. Run `/verify` with this bot.**\n\n"
+    "This is required so your activity, logs, and department progress can be properly tracked.\n\n"
+    "**2. Read the Department Guidelines**\n"
+    "Please review our full guidelines which can be found in {guidelines_channel}. These explain department expectations, logging rules, task validity, conduct, and other important information you are expected to follow.\n\n"
+    "**3. Complete the Internship Program**\n"
+    "All new members begin as **Trainee Technicians** and are required to complete the [Internship Program]({internship_url}) within **2 weeks** of joining.\n\n"
+    "The Internship Program card contains the full requirements, expectations, and information needed to rank up to **Junior Technician** and become a full member of the department.\n\n"
+    "Please read everything carefully, ask management if you have any questions, and good luck in {abbreviation}!"
+)
+
+
+def getenv_upgraded(name: str, default: str, legacy_value: str | None = None) -> str:
+    value = getenv_str(name)
+    if value is None or value == legacy_value:
+        return default
+    return value
+
+
 @dataclass(frozen=True)
 class BotConfig:
     # Core
@@ -154,11 +184,11 @@ class BotConfig:
     max_strikes: int = getenv_int("MAX_STRIKES", 3) or 3
 
     # Welcome
-    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to Engineering and Technical Service") or "Welcome to Engineering and Technical Service"
-    welcome_message: str = getenv_str(
-        "WELCOME_MESSAGE",
-        "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}",
-    ) or "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}"
+    welcome_title: str = getenv_upgraded("WELCOME_TITLE", WELCOME_TITLE_DEFAULT, LEGACY_WELCOME_TITLE)
+    welcome_department_display: str = getenv_str("WELCOME_DEPARTMENT_DISPLAY", WELCOME_DEPARTMENT_DISPLAY_DEFAULT) or WELCOME_DEPARTMENT_DISPLAY_DEFAULT
+    welcome_guidelines_channel: str = getenv_str("WELCOME_GUIDELINES_CHANNEL", WELCOME_GUIDELINES_CHANNEL_DEFAULT) or WELCOME_GUIDELINES_CHANNEL_DEFAULT
+    welcome_internship_url: str = getenv_str("WELCOME_INTERNSHIP_URL", WELCOME_INTERNSHIP_URL_DEFAULT) or WELCOME_INTERNSHIP_URL_DEFAULT
+    welcome_message: str = getenv_upgraded("WELCOME_MESSAGE", WELCOME_MESSAGE_DEFAULT, LEGACY_WELCOME_MESSAGE)
 
 
 CONFIG = BotConfig()
@@ -1150,9 +1180,12 @@ async def welcome(interaction: discord.Interaction, member: discord.Member, chan
         member=member.mention,
         member_name=member.display_name,
         department=CONFIG.department_name,
+        welcome_department=CONFIG.welcome_department_display,
         abbreviation=CONFIG.department_abbrev,
         group_url=CONFIG.department_group_url,
         description=CONFIG.department_description,
+        guidelines_channel=CONFIG.welcome_guidelines_channel,
+        internship_url=CONFIG.welcome_internship_url,
     )
     embed = discord.Embed(title=CONFIG.welcome_title, description=message, color=CONFIG.department_color, timestamp=utcnow())
     embed.set_footer(text=CONFIG.department_name)
