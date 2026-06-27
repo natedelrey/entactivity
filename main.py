@@ -154,11 +154,26 @@ class BotConfig:
     max_strikes: int = getenv_int("MAX_STRIKES", 3) or 3
 
     # Welcome
-    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to Engineering and Technical Service") or "Welcome to Engineering and Technical Service"
+    welcome_title: str = getenv_str("WELCOME_TITLE", "Welcome to Engineering & Technical Service") or "Welcome to Engineering & Technical Service"
+    welcome_department_display: str = getenv_str("WELCOME_DEPARTMENT_DISPLAY", "Engineering & Technical Service") or "Engineering & Technical Service"
+    welcome_guidelines_channel: str = getenv_str("WELCOME_GUIDELINES_CHANNEL", "<#1520160137132773376>") or "<#1520160137132773376>"
+    welcome_internship_url: str = getenv_str(
+        "WELCOME_INTERNSHIP_URL",
+        "https://trello.com/c/NqgrPAJF/6-internship-program",
+    ) or "https://trello.com/c/NqgrPAJF/6-internship-program"
     welcome_message: str = getenv_str(
         "WELCOME_MESSAGE",
-        "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}",
-    ) or "Welcome {member} to Engineering and Technical Service (E&T)! Please verify with `/verify`, review the department information, and stay active on-site.\n\n{description}\n\nGroup: {group_url}"
+        "Welcome, {member}, to **{welcome_department}!** ({abbreviation})\n\n"
+        "We’re glad to have you join the department. Before getting started, please make sure you complete the following:\n\n"
+        "**1. Run `/verify` with this bot.**\n\n"
+        "This is required so your activity, logs, and department progress can be properly tracked.\n\n"
+        "**2. Read the Department Guidelines**\n"
+        "Please review our full guidelines which can be found in {guidelines_channel}. These explain department expectations, logging rules, task validity, conduct, and other important information you are expected to follow.\n\n"
+        "**3. Complete the Internship Program**\n"
+        "All new members begin as **Trainee Technicians** and are required to complete the [Internship Program]({internship_url}) within **2 weeks** of joining.\n\n"
+        "The Internship Program card contains the full requirements, expectations, and information needed to rank up to **Junior Technician** and become a full member of the department.\n\n"
+        "Please read everything carefully, ask management if you have any questions, and good luck in {abbreviation}!",
+    ) or "Welcome, {member}, to **{welcome_department}!** ({abbreviation})"
 
 
 CONFIG = BotConfig()
@@ -1150,9 +1165,12 @@ async def welcome(interaction: discord.Interaction, member: discord.Member, chan
         member=member.mention,
         member_name=member.display_name,
         department=CONFIG.department_name,
+        welcome_department=CONFIG.welcome_department_display,
         abbreviation=CONFIG.department_abbrev,
         group_url=CONFIG.department_group_url,
         description=CONFIG.department_description,
+        guidelines_channel=CONFIG.welcome_guidelines_channel,
+        internship_url=CONFIG.welcome_internship_url,
     )
     embed = discord.Embed(title=CONFIG.welcome_title, description=message, color=CONFIG.department_color, timestamp=utcnow())
     embed.set_footer(text=CONFIG.department_name)
