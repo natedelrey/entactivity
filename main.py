@@ -166,7 +166,7 @@ class BotConfig:
     department_role_id: int | None = getenv_int("DEPARTMENT_ROLE_ID")
 
     # Applications
-    application_start_channel_id: int = getenv_int("APPLICATION_START_CHANNEL_ID", 1522202864246718524) or 1522202864246718524
+    application_start_channel_id: int = getenv_int("APPLICATION_START_CHANNEL_ID", 1520168176703246496) or 1520168176703246496
     application_pending_channel_id: int = getenv_int("APPLICATION_PENDING_CHANNEL_ID", 1520219147986796575) or 1520219147986796575
     application_accepted_channel_id: int = getenv_int("APPLICATION_ACCEPTED_CHANNEL_ID", 1520219188977864704) or 1520219188977864704
     application_denied_channel_id: int = getenv_int("APPLICATION_DENIED_CHANNEL_ID", 1520219215309832212) or 1520219215309832212
@@ -755,6 +755,10 @@ APPLICATION_QUESTIONS = [
     "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department? (Yes or No)",
 ]
 
+APPLICATION_PENDING_COLOR = discord.Color(0xA1904A)
+APPLICATION_ACCEPTED_COLOR = discord.Color.green()
+APPLICATION_DENIED_COLOR = discord.Color.red()
+
 
 def is_application_management(member: discord.Member) -> bool:
     return member.guild_permissions.administrator or any(role.id in CONFIG.application_management_role_ids for role in member.roles)
@@ -809,7 +813,13 @@ def build_application_embed(
     joined_guild_at: dt.datetime | None = None,
     submitted_at: dt.datetime | None = None,
 ) -> discord.Embed:
-    color = CONFIG.department_color
+    normalized_status = status.lower()
+    if normalized_status == "accepted":
+        color = APPLICATION_ACCEPTED_COLOR
+    elif normalized_status == "denied":
+        color = APPLICATION_DENIED_COLOR
+    else:
+        color = APPLICATION_PENDING_COLOR
     embed = discord.Embed(
         title=f"[E&T] Application #{app_id} — {status}",
         description=f"Applicant: {applicant.mention} (`{applicant.id}`)",
@@ -831,6 +841,24 @@ def build_application_embed(
     for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
         answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
         embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
+    embed.set_footer(text=CONFIG.department_name)
+    return embed
+
+
+def build_application_ticket_embed(
+    app_id: int,
+    applicant: discord.abc.User,
+    management_member: discord.abc.User,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"[E&T] Application #{app_id} Ticket",
+        description="Use this channel to discuss the application with the applicant and management team.",
+        color=APPLICATION_PENDING_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Application", value=f"Application #{app_id}", inline=True)
+    embed.add_field(name="Management Member", value=management_member.mention, inline=True)
+    embed.add_field(name="Applicant", value=f"{applicant.mention} (`{applicant.id}`)", inline=True)
     embed.set_footer(text=CONFIG.department_name)
     return embed
 
@@ -1177,6 +1205,21 @@ async def fetch_application(app_id: int) -> asyncpg.Record | None:
         return await conn.fetchrow("SELECT * FROM applications WHERE id=$1", app_id)
 
 
+async def delete_pending_application_message(row: asyncpg.Record) -> None:
+    pending_channel_id = row["pending_channel_id"]
+    pending_message_id = row["pending_message_id"]
+    if not pending_channel_id or not pending_message_id:
+        return
+    channel = bot.get_channel(int(pending_channel_id))
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        message = await channel.fetch_message(int(pending_message_id))
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def process_application_decision(interaction: discord.Interaction, app_id: int, accepted: bool, reason: str | None) -> None:
     row = await fetch_application(app_id)
     if not row:
@@ -1205,6 +1248,7 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
     destination = bot.get_channel(destination_id)
     if isinstance(destination, discord.TextChannel):
         await destination.send(embed=embed)
+    await delete_pending_application_message(row)
     async with bot.db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE applications SET status=$1, decided_by=$2, decision_reason=$3, decided_at=$4 WHERE id=$5",
@@ -1218,7 +1262,7 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
         await applicant.send(f"Your **[E&T] Entrance Exam** application has been **{status}**." + (f"\nReason: {reason}" if reason else ""))
     except discord.Forbidden:
         pass
-    if interaction.message:
+    if interaction.message and interaction.message.id != row["pending_message_id"]:
         await interaction.message.edit(view=None)
     await interaction.response.send_message(f"Application #{app_id} has been {status}.", ephemeral=True)
 
@@ -1256,8 +1300,8 @@ async def open_application_ticket(interaction: discord.Interaction, app_id: int)
     async with bot.db_pool.acquire() as conn:
         await conn.execute("UPDATE applications SET ticket_channel_id=$1 WHERE id=$2", channel.id, app_id)
     await channel.send(
-        f"{applicant.mention} <@&1520155690587390082> <@&1520155715455549530>\n"
-        f"Application #{app_id} discussion ticket opened by {interaction.user.mention}.",
+        f"{applicant.mention} <@&1520155690587390082> <@&1520155715455549530>",
+        embed=build_application_ticket_embed(app_id, applicant, interaction.user),
         view=ApplicationTicketView(),
     )
     await interaction.response.send_message(f"Ticket opened: {channel.mention}", ephemeral=True)
