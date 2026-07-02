@@ -755,9 +755,11 @@ APPLICATION_QUESTIONS = [
     "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department? (Yes or No)",
 ]
 
+APPLICATION_START_COLOR = discord.Color.gold()
 APPLICATION_PENDING_COLOR = discord.Color(0xA1904A)
 APPLICATION_ACCEPTED_COLOR = discord.Color.green()
 APPLICATION_DENIED_COLOR = discord.Color.red()
+APPLICATION_INFO_COLOR = discord.Color.blurple()
 
 
 def is_application_management(member: discord.Member) -> bool:
@@ -765,21 +767,49 @@ def is_application_management(member: discord.Member) -> bool:
 
 
 def application_panel_embed() -> discord.Embed:
-    description = (
-        "🛠️ **Before completing the [E&T] Entrance Exam,** it is strongly recommended\n"
-        "that you review the **E&T Information Hub.** This will help you better understand\n"
-        "the department, expectations, and the questions on this application.\n\n"
-        "📌 You should also make sure you are **pending in the Roblox group** before\n"
-        "submitting your application.\n\n"
-        "📚 **E&T Information Hub:**\n"
-        "https://trello.com/b/YO1hYYQZ/et-information-hub\n\n"
-        "👥 **Roblox Group:**\n"
-        f"{CONFIG.department_group_url}\n\n"
-        "✅ Once you have reviewed the information and are pending in the group, you may\n"
-        "begin the entrance exam."
+    embed = discord.Embed(
+        title="🟡 [E&T] Entrance Exam",
+        description=(
+            "Ready to join **Engineering & Technical Service**? Review the resources below, "
+            "make sure you are pending in the Roblox group, then press **Begin Application**."
+        ),
+        color=APPLICATION_START_COLOR,
+        timestamp=utcnow(),
     )
-    embed = discord.Embed(title="[E&T] Entrance Exam", description=description, color=CONFIG.department_color)
+    embed.add_field(
+        name="📚 Prepare First",
+        value=(
+            "Review the [E&T Information Hub](https://trello.com/b/YO1hYYQZ/et-information-hub) "
+            "so you understand department expectations and application questions."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="👥 Roblox Group",
+        value=f"Apply to/pending in the [Roblox group]({CONFIG.department_group_url}) before submitting.",
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ What Happens Next",
+        value="The bot will DM you each question, show a preview, then send your submission to management.",
+        inline=False,
+    )
     embed.set_footer(text="Click Begin Application to start in DMs.")
+    return embed
+
+
+def application_notice_embed(title: str, description: str, color: discord.Color | None = None) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color or APPLICATION_INFO_COLOR, timestamp=utcnow())
+    embed.set_footer(text=CONFIG.department_name)
+    return embed
+
+
+def application_question_embed(index: int, question: str) -> discord.Embed:
+    embed = application_notice_embed(
+        f"Question {index}/{len(APPLICATION_QUESTIONS)}",
+        f"**{question}**\n\nReply with your answer in one message. Type `cancel` at any time to stop.",
+        APPLICATION_PENDING_COLOR,
+    )
     return embed
 
 
@@ -820,14 +850,15 @@ def build_application_embed(
         color = APPLICATION_DENIED_COLOR
     else:
         color = APPLICATION_PENDING_COLOR
+    status_icon = {"accepted": "✅", "denied": "❌"}.get(normalized_status, "🕒")
     embed = discord.Embed(
-        title=f"[E&T] Application #{app_id} — {status}",
-        description=f"Applicant: {applicant.mention} (`{applicant.id}`)",
+        title=f"{status_icon} [E&T] Application #{app_id} — {status}",
+        description=f"**Applicant:** {applicant.mention} (`{applicant.id}`)",
         color=color,
         timestamp=utcnow(),
     )
     embed.add_field(
-        name="Submission stats",
+        name="📊 Submission Stats",
         value=(
             f"**UserId:** `{applicant.id}`\n"
             f"**Username:** `{applicant.name}`\n"
@@ -840,7 +871,7 @@ def build_application_embed(
     )
     for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
         answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
-        embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
+        embed.add_field(name=f"❔ Q{idx}: {question}", value=answer[:1024], inline=False)
     embed.set_footer(text=CONFIG.department_name)
     return embed
 
@@ -851,8 +882,8 @@ def build_application_ticket_embed(
     management_member: discord.abc.User,
 ) -> discord.Embed:
     embed = discord.Embed(
-        title=f"[E&T] Application #{app_id} Ticket",
-        description="Use this channel to discuss the application with the applicant and management team.",
+        title=f"🎫 [E&T] Application #{app_id} Ticket",
+        description="Use this private channel to discuss the application with the applicant and management team.",
         color=APPLICATION_PENDING_COLOR,
         timestamp=utcnow(),
     )
@@ -865,14 +896,14 @@ def build_application_ticket_embed(
 
 def build_application_preview_embed(answers: list[str]) -> discord.Embed:
     embed = discord.Embed(
-        title="[E&T] Application Submission Preview",
+        title="📝 [E&T] Application Submission Preview",
         description="Review your answers below. Use an edit button to change a specific answer, or submit when everything looks correct.",
-        color=CONFIG.department_color,
+        color=APPLICATION_PENDING_COLOR,
         timestamp=utcnow(),
     )
     for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
         answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
-        embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
+        embed.add_field(name=f"❔ Q{idx}: {question}", value=answer[:1024], inline=False)
     return embed
 
 
@@ -992,11 +1023,24 @@ class ApplicationStartView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             dm = await interaction.user.create_dm()
-            await dm.send("You are beginning the **[E&T] Entrance Exam**. Please answer each question in one message. Type `cancel` at any time to stop.")
+            await dm.send(
+                embed=application_notice_embed(
+                    "🛠️ Entrance Exam Started",
+                    "Please answer each question in one message. Type `cancel` at any time to stop.",
+                    APPLICATION_START_COLOR,
+                )
+            )
         except discord.Forbidden:
             help_channel = bot.get_channel(CONFIG.application_dm_help_channel_id)
             if isinstance(help_channel, discord.TextChannel):
-                await help_channel.send(f"{interaction.user.mention}, please allow Direct Messages for this server so the bot can begin your application.")
+                await help_channel.send(
+                    content=interaction.user.mention,
+                    embed=application_notice_embed(
+                        "DMs Required",
+                        "Please allow Direct Messages for this server so the bot can begin your application.",
+                        APPLICATION_DENIED_COLOR,
+                    ),
+                )
             await interaction.followup.send("I could not DM you. Please enable Direct Messages for this server and try again.", ephemeral=True)
             return
 
@@ -1004,13 +1048,26 @@ class ApplicationStartView(discord.ui.View):
         answers: list[str] = []
         started_at = utcnow()
         for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
-            await dm.send(f"**Question {idx}/{len(APPLICATION_QUESTIONS)}**\n{question}")
+            await dm.send(embed=application_question_embed(idx, question))
             if idx == len(APPLICATION_QUESTIONS):
                 yes_no_view = YesNoQuestionView(interaction.user.id)
-                await dm.send("Please click one of the buttons below.", view=yes_no_view)
+                await dm.send(
+                    embed=application_notice_embed(
+                        "Choose an Answer",
+                        "Please click one of the buttons below.",
+                        APPLICATION_PENDING_COLOR,
+                    ),
+                    view=yes_no_view,
+                )
                 await yes_no_view.wait()
                 if yes_no_view.answer is None:
-                    await dm.send("Your application timed out. Please click **Begin Application** again when you are ready.")
+                    await dm.send(
+                        embed=application_notice_embed(
+                            "Application Timed Out",
+                            "Please click **Begin Application** again when you are ready.",
+                            APPLICATION_DENIED_COLOR,
+                        )
+                    )
                     return
                 answers.append(yes_no_view.answer)
                 continue
@@ -1021,10 +1078,22 @@ class ApplicationStartView(discord.ui.View):
                     check=lambda m: m.author.id == interaction.user.id and isinstance(m.channel, discord.DMChannel),
                 )
             except asyncio.TimeoutError:
-                await dm.send("Your application timed out. Please click **Begin Application** again when you are ready.")
+                await dm.send(
+                    embed=application_notice_embed(
+                        "Application Timed Out",
+                        "Please click **Begin Application** again when you are ready.",
+                        APPLICATION_DENIED_COLOR,
+                    )
+                )
                 return
             if msg.content.strip().lower() == "cancel":
-                await dm.send("Your application has been cancelled.")
+                await dm.send(
+                    embed=application_notice_embed(
+                        "Application Cancelled",
+                        "Your application has been cancelled. You can begin again when ready.",
+                        APPLICATION_DENIED_COLOR,
+                    )
+                )
                 return
             answers.append(msg.content.strip()[:3900] or "No answer provided.")
 
@@ -1032,7 +1101,13 @@ class ApplicationStartView(discord.ui.View):
         await dm.send(embed=build_application_preview_embed(answers), view=preview_view)
         await preview_view.wait()
         if not preview_view.submitted:
-            await dm.send("Your application preview timed out. Please click **Begin Application** again when you are ready.")
+            await dm.send(
+                embed=application_notice_embed(
+                    "Preview Timed Out",
+                    "Please click **Begin Application** again when you are ready.",
+                    APPLICATION_DENIED_COLOR,
+                )
+            )
             return
 
         submitted_at = utcnow()
@@ -1040,7 +1115,13 @@ class ApplicationStartView(discord.ui.View):
         joined_guild_at = interaction.user.joined_at
 
         if not bot.db_pool:
-            await dm.send("The database is currently unavailable. Please contact management.")
+            await dm.send(
+                embed=application_notice_embed(
+                    "Database Unavailable",
+                    "Please contact management so they can help with your application.",
+                    APPLICATION_DENIED_COLOR,
+                )
+            )
             return
         async with bot.db_pool.acquire() as conn:
             app_id = await conn.fetchval(
@@ -1064,7 +1145,13 @@ class ApplicationStartView(discord.ui.View):
             )
         pending_channel = bot.get_channel(CONFIG.application_pending_channel_id)
         if not isinstance(pending_channel, discord.TextChannel):
-            await dm.send("Your application was saved, but the pending applications channel could not be found. Please contact management.")
+            await dm.send(
+                embed=application_notice_embed(
+                    "Application Saved",
+                    "The pending applications channel could not be found. Please contact management.",
+                    APPLICATION_DENIED_COLOR,
+                )
+            )
             return
         sent = await pending_channel.send(
             embed=build_application_embed(
@@ -1079,7 +1166,13 @@ class ApplicationStartView(discord.ui.View):
         )
         async with bot.db_pool.acquire() as conn:
             await conn.execute("UPDATE applications SET pending_message_id=$1, pending_channel_id=$2 WHERE id=$3", sent.id, pending_channel.id, int(app_id))
-        await dm.send("Your application has been submitted. Management will review it and you will be notified when a decision is made.")
+        await dm.send(
+            embed=application_notice_embed(
+                "✅ Application Submitted",
+                "Management will review your application and you will be notified when a decision is made.",
+                APPLICATION_ACCEPTED_COLOR,
+            )
+        )
 
 
 class DecisionReasonModal(discord.ui.Modal):
@@ -1259,7 +1352,14 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
             app_id,
         )
     try:
-        await applicant.send(f"Your **[E&T] Entrance Exam** application has been **{status}**." + (f"\nReason: {reason}" if reason else ""))
+        await applicant.send(
+            embed=application_notice_embed(
+                f"Application {status.title()}",
+                f"Your **[E&T] Entrance Exam** application has been **{status}**."
+                + (f"\n\n**Reason:** {reason}" if reason else ""),
+                APPLICATION_ACCEPTED_COLOR if accepted else APPLICATION_DENIED_COLOR,
+            )
+        )
     except discord.Forbidden:
         pass
     if interaction.message and interaction.message.id != row["pending_message_id"]:
