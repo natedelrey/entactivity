@@ -140,7 +140,7 @@ class BotConfig:
     # Department branding
     department_name: str = getenv_str("DEPARTMENT_NAME", "Engineering and Technical Service") or "Engineering and Technical Service"
     department_abbrev: str = getenv_str("DEPARTMENT_ABBREVIATION", "E&T") or "E&T"
-    department_color: discord.Color = getenv_color("DEPARTMENT_COLOR", "2F6F8F")
+    department_color: discord.Color = getenv_color("DEPARTMENT_COLOR", "A3904C")
     department_group_url: str = getenv_str(
         "DEPARTMENT_GROUP_URL",
         "https://www.roblox.com/communities/515594004/SCPF-Engineering-and-Technical-Service#!/about",
@@ -375,6 +375,8 @@ class ETBot(commands.Bot):
                     decided_at TIMESTAMPTZ
                 );
             """)
+            await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_duration_seconds INT;")
+            await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS applicant_joined_at TIMESTAMPTZ;")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_panels (
                     panel_key TEXT PRIMARY KEY,
@@ -643,6 +645,7 @@ async def on_ready() -> None:
     if not bot._application_views_registered:
         bot.add_view(ApplicationStartView())
         bot.add_view(ApplicationReviewView())
+        bot.add_view(ApplicationTicketView())
         bot._application_views_registered = True
     await ensure_application_panel()
     if CONFIG.auto_weekly_report or CONFIG.auto_weekly_reset:
@@ -776,23 +779,176 @@ def application_panel_embed() -> discord.Embed:
     return embed
 
 
-def build_application_embed(app_id: int, applicant: discord.abc.User, answers: list[str], status: str = "Pending") -> discord.Embed:
-    color = discord.Color.gold()
-    if status.lower() == "accepted":
-        color = discord.Color.green()
-    elif status.lower() == "denied":
-        color = discord.Color.red()
+def format_datetime(value: dt.datetime | None) -> str:
+    if not value:
+        return "Unknown"
+    timestamp = int(value.timestamp())
+    return f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "Unknown"
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, mins = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {mins}m {secs}s"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def build_application_embed(
+    app_id: int,
+    applicant: discord.abc.User,
+    answers: list[str],
+    status: str = "Pending",
+    *,
+    duration_seconds: int | None = None,
+    joined_guild_at: dt.datetime | None = None,
+    submitted_at: dt.datetime | None = None,
+) -> discord.Embed:
+    color = CONFIG.department_color
     embed = discord.Embed(
         title=f"[E&T] Application #{app_id} — {status}",
         description=f"Applicant: {applicant.mention} (`{applicant.id}`)",
         color=color,
         timestamp=utcnow(),
     )
+    embed.add_field(
+        name="Submission stats",
+        value=(
+            f"**UserId:** `{applicant.id}`\n"
+            f"**Username:** `{applicant.name}`\n"
+            f"**User:** {applicant.mention}\n"
+            f"**Duration:** {format_duration(duration_seconds)}\n"
+            f"**Joined guild:** {format_datetime(joined_guild_at)}\n"
+            f"**Submitted:** {format_datetime(submitted_at)}"
+        ),
+        inline=False,
+    )
     for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
         answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
         embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
     embed.set_footer(text=CONFIG.department_name)
     return embed
+
+
+def build_application_preview_embed(answers: list[str]) -> discord.Embed:
+    embed = discord.Embed(
+        title="[E&T] Application Submission Preview",
+        description="Review your answers below. Use an edit button to change a specific answer, or submit when everything looks correct.",
+        color=CONFIG.department_color,
+        timestamp=utcnow(),
+    )
+    for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
+        answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
+        embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
+    return embed
+
+
+class YesNoQuestionView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.answer: str | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("This application prompt is not for you.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        self.answer = "Yes"
+        await interaction.response.edit_message(content="You selected **Yes**.", view=None)
+        self.stop()
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        self.answer = "No"
+        await interaction.response.edit_message(content="You selected **No**.", view=None)
+        self.stop()
+
+
+class ApplicationPreviewView(discord.ui.View):
+    def __init__(self, user_id: int, answers: list[str]):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.answers = answers
+        self.submitted = False
+
+        for idx in range(len(APPLICATION_QUESTIONS)):
+            self.add_item(EditAnswerButton(idx))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("This application preview is not for you.", ephemeral=True)
+        return False
+
+    async def refresh_preview(self, interaction: discord.Interaction) -> None:
+        await interaction.message.edit(embed=build_application_preview_embed(self.answers), view=self)
+
+    @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, row=4)
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        self.submitted = True
+        await interaction.response.edit_message(content="Submitting your application...", embed=None, view=None)
+        self.stop()
+
+
+class EditAnswerButton(discord.ui.Button):
+    def __init__(self, question_index: int):
+        super().__init__(
+            label=f"Edit Q{question_index + 1}",
+            style=discord.ButtonStyle.secondary,
+            row=question_index // 3,
+        )
+        self.question_index = question_index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ApplicationPreviewView):
+            return
+        question = APPLICATION_QUESTIONS[self.question_index]
+        dm = interaction.channel
+        if self.question_index == len(APPLICATION_QUESTIONS) - 1:
+            yes_no_view = YesNoQuestionView(interaction.user.id)
+            await interaction.response.send_message(
+                f"Please choose your new answer for **Q{self.question_index + 1}: {question}**.",
+                view=yes_no_view,
+            )
+            await yes_no_view.wait()
+            if yes_no_view.answer is None:
+                await dm.send("That edit timed out. You can press the edit button again if needed.")
+                return
+            view.answers[self.question_index] = yes_no_view.answer
+            await dm.send(f"Updated **Q{self.question_index + 1}**.")
+            if interaction.message:
+                await view.refresh_preview(interaction)
+            return
+        await interaction.response.send_message(f"Please send your new answer for **Q{self.question_index + 1}: {question}**.", ephemeral=False)
+        try:
+            msg = await bot.wait_for(
+                "message",
+                timeout=900,
+                check=lambda m: m.author.id == interaction.user.id and m.channel.id == dm.id,
+            )
+        except asyncio.TimeoutError:
+            await dm.send("That edit timed out. You can press the edit button again if needed.")
+            return
+        if msg.content.strip().lower() == "cancel":
+            await dm.send("Edit cancelled. Your previous answer was kept.")
+            return
+        view.answers[self.question_index] = msg.content.strip()[:3900] or "No answer provided."
+        await dm.send(f"Updated **Q{self.question_index + 1}**.")
+        if interaction.message:
+            await view.refresh_preview(interaction)
 
 
 class ApplicationStartView(discord.ui.View):
@@ -818,8 +974,18 @@ class ApplicationStartView(discord.ui.View):
 
         await interaction.followup.send("I sent you a DM to begin your application.", ephemeral=True)
         answers: list[str] = []
-        for question in APPLICATION_QUESTIONS:
-            await dm.send(f"**{question}**")
+        started_at = utcnow()
+        for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
+            await dm.send(f"**Question {idx}/{len(APPLICATION_QUESTIONS)}**\n{question}")
+            if idx == len(APPLICATION_QUESTIONS):
+                yes_no_view = YesNoQuestionView(interaction.user.id)
+                await dm.send("Please click one of the buttons below.", view=yes_no_view)
+                await yes_no_view.wait()
+                if yes_no_view.answer is None:
+                    await dm.send("Your application timed out. Please click **Begin Application** again when you are ready.")
+                    return
+                answers.append(yes_no_view.answer)
+                continue
             try:
                 msg = await bot.wait_for(
                     "message",
@@ -834,20 +1000,55 @@ class ApplicationStartView(discord.ui.View):
                 return
             answers.append(msg.content.strip()[:3900] or "No answer provided.")
 
+        preview_view = ApplicationPreviewView(interaction.user.id, answers)
+        await dm.send(embed=build_application_preview_embed(answers), view=preview_view)
+        await preview_view.wait()
+        if not preview_view.submitted:
+            await dm.send("Your application preview timed out. Please click **Begin Application** again when you are ready.")
+            return
+
+        submitted_at = utcnow()
+        duration_seconds = int((submitted_at - started_at).total_seconds())
+        joined_guild_at = interaction.user.joined_at
+
         if not bot.db_pool:
             await dm.send("The database is currently unavailable. Please contact management.")
             return
         async with bot.db_pool.acquire() as conn:
             app_id = await conn.fetchval(
-                "INSERT INTO applications (applicant_id, answers_json, status) VALUES ($1, $2, 'pending') RETURNING id",
+                """
+                INSERT INTO applications (
+                    applicant_id,
+                    answers_json,
+                    status,
+                    application_duration_seconds,
+                    applicant_joined_at,
+                    created_at
+                )
+                VALUES ($1, $2, 'pending', $3, $4, $5)
+                RETURNING id
+                """,
                 interaction.user.id,
                 json.dumps(answers),
+                duration_seconds,
+                joined_guild_at,
+                submitted_at,
             )
         pending_channel = bot.get_channel(CONFIG.application_pending_channel_id)
         if not isinstance(pending_channel, discord.TextChannel):
             await dm.send("Your application was saved, but the pending applications channel could not be found. Please contact management.")
             return
-        sent = await pending_channel.send(embed=build_application_embed(int(app_id), interaction.user, answers), view=ApplicationReviewView())
+        sent = await pending_channel.send(
+            embed=build_application_embed(
+                int(app_id),
+                interaction.user,
+                answers,
+                duration_seconds=duration_seconds,
+                joined_guild_at=joined_guild_at,
+                submitted_at=submitted_at,
+            ),
+            view=ApplicationReviewView(),
+        )
         async with bot.db_pool.acquire() as conn:
             await conn.execute("UPDATE applications SET pending_message_id=$1, pending_channel_id=$2 WHERE id=$3", sent.id, pending_channel.id, int(app_id))
         await dm.send("Your application has been submitted. Management will review it and you will be notified when a decision is made.")
@@ -919,6 +1120,29 @@ class ApplicationReviewView(discord.ui.View):
         if app_id:
             await open_application_ticket(interaction, app_id)
 
+
+class ApplicationTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member) and is_application_management(interaction.user):
+            return True
+        await interaction.response.send_message("Only E&T management+ can close application tickets.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="application_ticket:close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("This button can only close a server ticket channel.", ephemeral=True)
+            return
+        await interaction.response.send_message("Closing this ticket and deleting the channel...", ephemeral=True)
+        try:
+            await interaction.channel.delete(reason=f"Application ticket closed by {interaction.user}")
+        except discord.HTTPException:
+            await interaction.followup.send("I could not delete this ticket channel. Please check my permissions.", ephemeral=True)
+
 async def ensure_application_panel() -> None:
     if not bot.db_pool:
         return
@@ -967,7 +1191,15 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
     if applicant is None:
         applicant = await bot.fetch_user(int(row["applicant_id"]))
     answers = json.loads(row["answers_json"])
-    embed = build_application_embed(app_id, applicant, answers, status.title())
+    embed = build_application_embed(
+        app_id,
+        applicant,
+        answers,
+        status.title(),
+        duration_seconds=row["application_duration_seconds"],
+        joined_guild_at=row["applicant_joined_at"],
+        submitted_at=row["created_at"],
+    )
     embed.add_field(name="Processed By", value=interaction.user.mention, inline=True)
     embed.add_field(name="Reason", value=(reason or "No reason provided.")[:1024], inline=False)
     destination = bot.get_channel(destination_id)
@@ -1023,7 +1255,11 @@ async def open_application_ticket(interaction: discord.Interaction, app_id: int)
     )
     async with bot.db_pool.acquire() as conn:
         await conn.execute("UPDATE applications SET ticket_channel_id=$1 WHERE id=$2", channel.id, app_id)
-    await channel.send(f"{applicant.mention} <@&1520155690587390082> <@&1520155715455549530>\nApplication #{app_id} discussion ticket opened by {interaction.user.mention}.")
+    await channel.send(
+        f"{applicant.mention} <@&1520155690587390082> <@&1520155715455549530>\n"
+        f"Application #{app_id} discussion ticket opened by {interaction.user.mention}.",
+        view=ApplicationTicketView(),
+    )
     await interaction.response.send_message(f"Ticket opened: {channel.mention}", ephemeral=True)
 
 
