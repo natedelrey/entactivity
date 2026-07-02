@@ -165,6 +165,15 @@ class BotConfig:
     welcome_manager_role_id: int | None = getenv_int("WELCOME_MANAGER_ROLE_ID")
     department_role_id: int | None = getenv_int("DEPARTMENT_ROLE_ID")
 
+    # Applications
+    application_start_channel_id: int = getenv_int("APPLICATION_START_CHANNEL_ID", 1522202864246718524) or 1522202864246718524
+    application_pending_channel_id: int = getenv_int("APPLICATION_PENDING_CHANNEL_ID", 1520219147986796575) or 1520219147986796575
+    application_accepted_channel_id: int = getenv_int("APPLICATION_ACCEPTED_CHANNEL_ID", 1520219188977864704) or 1520219188977864704
+    application_denied_channel_id: int = getenv_int("APPLICATION_DENIED_CHANNEL_ID", 1520219215309832212) or 1520219215309832212
+    application_dm_help_channel_id: int = getenv_int("APPLICATION_DM_HELP_CHANNEL_ID", 1520162557774532649) or 1520162557774532649
+    application_ticket_category_id: int = getenv_int("APPLICATION_TICKET_CATEGORY_ID", 1521669739414290462) or 1521669739414290462
+    application_management_role_ids: tuple[int, ...] = (1520155690587390082, 1520155715455549530)
+
     # Roblox service/webhooks
     api_secret_key: str | None = getenv_str("API_SECRET_KEY")
     roblox_group_id: int = getenv_int("ROBLOX_GROUP_ID", 515594004) or 515594004
@@ -234,6 +243,7 @@ class ETBot(commands.Bot):
         self.web_site: web.TCPSite | None = None
         self._bootstrap_lock = asyncio.Lock()
         self._bootstrapped = False
+        self._application_views_registered = False
 
     async def setup_hook(self) -> None:
         if not CONFIG.database_url:
@@ -347,6 +357,29 @@ class ETBot(commands.Bot):
                     week_key TEXT NOT NULL,
                     report_json JSONB NOT NULL,
                     created_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS applications (
+                    id BIGSERIAL PRIMARY KEY,
+                    applicant_id BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    answers_json JSONB NOT NULL,
+                    pending_message_id BIGINT,
+                    pending_channel_id BIGINT,
+                    decided_by BIGINT,
+                    decision_reason TEXT,
+                    ticket_channel_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    decided_at TIMESTAMPTZ
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_panels (
+                    panel_key TEXT PRIMARY KEY,
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
             """)
@@ -607,6 +640,11 @@ async def require_db(interaction: discord.Interaction) -> bool:
 @bot.event
 async def on_ready() -> None:
     print(f"[READY] Logged in as {bot.user}.")
+    if not bot._application_views_registered:
+        bot.add_view(ApplicationStartView())
+        bot.add_view(ApplicationReviewView())
+        bot._application_views_registered = True
+    await ensure_application_panel()
     if CONFIG.auto_weekly_report or CONFIG.auto_weekly_reset:
         weekly_scheduler.start()
 
@@ -700,6 +738,293 @@ async def rank_autocomplete(interaction: discord.Interaction, current: str) -> l
     if current_lower:
         names = [name for name in names if current_lower in name.lower()]
     return [app_commands.Choice(name=name[:100], value=name[:100]) for name in names[:25]]
+
+
+# ============================================================
+# Applications
+# ============================================================
+
+APPLICATION_QUESTIONS = [
+    "Why do you want to join Engineering & Technical Service?",
+    "What does Engineering & Technical Service do within the facility?",
+    "If you made a mistake while completing a repair or log, what would you do?",
+    "What qualities do you think a good E&T member should have?",
+    "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department? (Yes or No)",
+]
+
+
+def is_application_management(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator or any(role.id in CONFIG.application_management_role_ids for role in member.roles)
+
+
+def application_panel_embed() -> discord.Embed:
+    description = (
+        "🛠️ **Before completing the [E&T] Entrance Exam,** it is strongly recommended\n"
+        "that you review the **E&T Information Hub.** This will help you better understand\n"
+        "the department, expectations, and the questions on this application.\n\n"
+        "📌 You should also make sure you are **pending in the Roblox group** before\n"
+        "submitting your application.\n\n"
+        "📚 **E&T Information Hub:**\n"
+        "https://trello.com/b/YO1hYYQZ/et-information-hub\n\n"
+        "👥 **Roblox Group:**\n"
+        f"{CONFIG.department_group_url}\n\n"
+        "✅ Once you have reviewed the information and are pending in the group, you may\n"
+        "begin the entrance exam."
+    )
+    embed = discord.Embed(title="[E&T] Entrance Exam", description=description, color=CONFIG.department_color)
+    embed.set_footer(text="Click Begin Application to start in DMs.")
+    return embed
+
+
+def build_application_embed(app_id: int, applicant: discord.abc.User, answers: list[str], status: str = "Pending") -> discord.Embed:
+    color = discord.Color.gold()
+    if status.lower() == "accepted":
+        color = discord.Color.green()
+    elif status.lower() == "denied":
+        color = discord.Color.red()
+    embed = discord.Embed(
+        title=f"[E&T] Application #{app_id} — {status}",
+        description=f"Applicant: {applicant.mention} (`{applicant.id}`)",
+        color=color,
+        timestamp=utcnow(),
+    )
+    for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
+        answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
+        embed.add_field(name=f"Q{idx}: {question}", value=answer[:1024], inline=False)
+    embed.set_footer(text=CONFIG.department_name)
+    return embed
+
+
+class ApplicationStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Begin Application", style=discord.ButtonStyle.success, custom_id="application:begin")
+    async def begin(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Applications must be started from the server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            dm = await interaction.user.create_dm()
+            await dm.send("You are beginning the **[E&T] Entrance Exam**. Please answer each question in one message. Type `cancel` at any time to stop.")
+        except discord.Forbidden:
+            help_channel = bot.get_channel(CONFIG.application_dm_help_channel_id)
+            if isinstance(help_channel, discord.TextChannel):
+                await help_channel.send(f"{interaction.user.mention}, please allow Direct Messages for this server so the bot can begin your application.")
+            await interaction.followup.send("I could not DM you. Please enable Direct Messages for this server and try again.", ephemeral=True)
+            return
+
+        await interaction.followup.send("I sent you a DM to begin your application.", ephemeral=True)
+        answers: list[str] = []
+        for question in APPLICATION_QUESTIONS:
+            await dm.send(f"**{question}**")
+            try:
+                msg = await bot.wait_for(
+                    "message",
+                    timeout=900,
+                    check=lambda m: m.author.id == interaction.user.id and isinstance(m.channel, discord.DMChannel),
+                )
+            except asyncio.TimeoutError:
+                await dm.send("Your application timed out. Please click **Begin Application** again when you are ready.")
+                return
+            if msg.content.strip().lower() == "cancel":
+                await dm.send("Your application has been cancelled.")
+                return
+            answers.append(msg.content.strip()[:3900] or "No answer provided.")
+
+        if not bot.db_pool:
+            await dm.send("The database is currently unavailable. Please contact management.")
+            return
+        async with bot.db_pool.acquire() as conn:
+            app_id = await conn.fetchval(
+                "INSERT INTO applications (applicant_id, answers_json, status) VALUES ($1, $2, 'pending') RETURNING id",
+                interaction.user.id,
+                json.dumps(answers),
+            )
+        pending_channel = bot.get_channel(CONFIG.application_pending_channel_id)
+        if not isinstance(pending_channel, discord.TextChannel):
+            await dm.send("Your application was saved, but the pending applications channel could not be found. Please contact management.")
+            return
+        sent = await pending_channel.send(embed=build_application_embed(int(app_id), interaction.user, answers), view=ApplicationReviewView())
+        async with bot.db_pool.acquire() as conn:
+            await conn.execute("UPDATE applications SET pending_message_id=$1, pending_channel_id=$2 WHERE id=$3", sent.id, pending_channel.id, int(app_id))
+        await dm.send("Your application has been submitted. Management will review it and you will be notified when a decision is made.")
+
+
+class DecisionReasonModal(discord.ui.Modal):
+    def __init__(self, app_id: int, accepted: bool):
+        super().__init__(title=f"{'Accept' if accepted else 'Deny'} Application #{app_id}")
+        self.app_id = app_id
+        self.accepted = accepted
+        self.reason = discord.ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, max_length=1000)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await process_application_decision(interaction, self.app_id, self.accepted, str(self.reason.value))
+
+
+class ApplicationReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if isinstance(interaction.user, discord.Member) and is_application_management(interaction.user):
+            return True
+        await interaction.response.send_message("Only E&T management+ can process applications.", ephemeral=True)
+        return False
+
+    def app_id_from_embed(self, interaction: discord.Interaction) -> int | None:
+        if not interaction.message or not interaction.message.embeds:
+            return None
+        title = interaction.message.embeds[0].title or ""
+        try:
+            return int(title.split("#", 1)[1].split()[0])
+        except (IndexError, ValueError):
+            return None
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="application:accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await process_application_decision(interaction, app_id, True, None)
+
+    @discord.ui.button(label="Accept with Reason", style=discord.ButtonStyle.primary, custom_id="application:accept_reason")
+    async def accept_reason(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await interaction.response.send_modal(DecisionReasonModal(app_id, True))
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="application:deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await process_application_decision(interaction, app_id, False, None)
+
+    @discord.ui.button(label="Deny with Reason", style=discord.ButtonStyle.danger, custom_id="application:deny_reason")
+    async def deny_reason(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await interaction.response.send_modal(DecisionReasonModal(app_id, False))
+
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.secondary, custom_id="application:ticket")
+    async def ticket(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await open_application_ticket(interaction, app_id)
+
+async def ensure_application_panel() -> None:
+    if not bot.db_pool:
+        return
+    channel = bot.get_channel(CONFIG.application_start_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT message_id FROM bot_panels WHERE panel_key='application_start'")
+    if row:
+        try:
+            await channel.fetch_message(int(row["message_id"]))
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    message = await channel.send(embed=application_panel_embed(), view=ApplicationStartView())
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_panels (panel_key, channel_id, message_id)
+            VALUES ('application_start', $1, $2)
+            ON CONFLICT (panel_key) DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id
+            """,
+            channel.id,
+            message.id,
+        )
+
+
+async def fetch_application(app_id: int) -> asyncpg.Record | None:
+    if not bot.db_pool:
+        return None
+    async with bot.db_pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM applications WHERE id=$1", app_id)
+
+
+async def process_application_decision(interaction: discord.Interaction, app_id: int, accepted: bool, reason: str | None) -> None:
+    row = await fetch_application(app_id)
+    if not row:
+        await interaction.response.send_message("I could not find that application.", ephemeral=True)
+        return
+    if row["status"] != "pending":
+        await interaction.response.send_message("That application has already been processed.", ephemeral=True)
+        return
+    status = "accepted" if accepted else "denied"
+    destination_id = CONFIG.application_accepted_channel_id if accepted else CONFIG.application_denied_channel_id
+    applicant = interaction.guild.get_member(int(row["applicant_id"])) if interaction.guild else bot.get_user(int(row["applicant_id"]))
+    if applicant is None:
+        applicant = await bot.fetch_user(int(row["applicant_id"]))
+    answers = json.loads(row["answers_json"])
+    embed = build_application_embed(app_id, applicant, answers, status.title())
+    embed.add_field(name="Processed By", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Reason", value=(reason or "No reason provided.")[:1024], inline=False)
+    destination = bot.get_channel(destination_id)
+    if isinstance(destination, discord.TextChannel):
+        await destination.send(embed=embed)
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE applications SET status=$1, decided_by=$2, decision_reason=$3, decided_at=$4 WHERE id=$5",
+            status,
+            interaction.user.id,
+            reason,
+            utcnow(),
+            app_id,
+        )
+    try:
+        await applicant.send(f"Your **[E&T] Entrance Exam** application has been **{status}**." + (f"\nReason: {reason}" if reason else ""))
+    except discord.Forbidden:
+        pass
+    if interaction.message:
+        await interaction.message.edit(view=None)
+    await interaction.response.send_message(f"Application #{app_id} has been {status}.", ephemeral=True)
+
+
+async def open_application_ticket(interaction: discord.Interaction, app_id: int) -> None:
+    row = await fetch_application(app_id)
+    if not row:
+        await interaction.response.send_message("I could not find that application.", ephemeral=True)
+        return
+    if row["ticket_channel_id"]:
+        await interaction.response.send_message(f"A ticket already exists: <#{row['ticket_channel_id']}>", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Tickets can only be opened in the server.", ephemeral=True)
+        return
+    applicant = guild.get_member(int(row["applicant_id"])) or await guild.fetch_member(int(row["applicant_id"]))
+    category = guild.get_channel(CONFIG.application_ticket_category_id)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        applicant: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    for role_id in CONFIG.application_management_role_ids:
+        role = guild.get_role(role_id)
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    channel = await guild.create_text_channel(
+        name=f"app-{app_id}-{applicant.name}"[:100],
+        category=category if isinstance(category, discord.CategoryChannel) else None,
+        overwrites=overwrites,
+        topic=f"Application #{app_id} discussion for {applicant} ({applicant.id})",
+        reason=f"Application #{app_id} ticket opened by {interaction.user}",
+    )
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute("UPDATE applications SET ticket_channel_id=$1 WHERE id=$2", channel.id, app_id)
+    await channel.send(f"{applicant.mention} <@&1520155690587390082> <@&1520155715455549530>\nApplication #{app_id} discussion ticket opened by {interaction.user.mention}.")
+    await interaction.response.send_message(f"Ticket opened: {channel.mention}", ephemeral=True)
 
 
 # ============================================================
