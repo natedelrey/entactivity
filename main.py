@@ -752,7 +752,7 @@ APPLICATION_QUESTIONS = [
     "What does Engineering & Technical Service do within the facility?",
     "If you made a mistake while completing a repair or log, what would you do?",
     "What qualities do you think a good E&T member should have?",
-    "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department? (Yes or No)",
+    "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department?",
 ]
 
 APPLICATION_START_COLOR = discord.Color.gold()
@@ -768,33 +768,24 @@ def is_application_management(member: discord.Member) -> bool:
 
 def application_panel_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🟡 [E&T] Entrance Exam",
+        title="[E&T] Entrance Exam",
         description=(
-            "Ready to join **Engineering & Technical Service**? Review the resources below, "
-            "make sure you are pending in the Roblox group, then press **Begin Application**."
+            "🛠️ **Before completing the [E&T] Entrance Exam**, it is strongly "
+            "recommended that you review the **E&T Information Hub**. This will help "
+            "you better understand the department, expectations, and the questions "
+            "on this application.\n\n"
+            "📌 You should also make sure you are **pending in the Roblox group** "
+            "before submitting your application.\n\n"
+            "📚 **E&T Information Hub:**\n"
+            "https://trello.com/b/YO1hYYQZ/et-information-hub\n\n"
+            "👥 **Roblox Group:**\n"
+            f"{CONFIG.department_group_url}\n\n"
+            "✅ Once you have reviewed the information and are pending in the group, "
+            "you may begin the entrance exam."
         ),
         color=APPLICATION_START_COLOR,
         timestamp=utcnow(),
     )
-    embed.add_field(
-        name="📚 Prepare First",
-        value=(
-            "Review the [E&T Information Hub](https://trello.com/b/YO1hYYQZ/et-information-hub) "
-            "so you understand department expectations and application questions."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="👥 Roblox Group",
-        value=f"Apply to/pending in the [Roblox group]({CONFIG.department_group_url}) before submitting.",
-        inline=False,
-    )
-    embed.add_field(
-        name="✅ What Happens Next",
-        value="The bot will DM you each question, show a preview, then send your submission to management.",
-        inline=False,
-    )
-    embed.set_footer(text="Click Begin Application to start in DMs.")
     return embed
 
 
@@ -805,9 +796,12 @@ def application_notice_embed(title: str, description: str, color: discord.Color 
 
 
 def application_question_embed(index: int, question: str) -> discord.Embed:
+    instructions = "Reply with your answer in one message. Type `cancel` at any time to stop."
+    if index == len(APPLICATION_QUESTIONS):
+        instructions = "Please click **Yes** or **No** below."
     embed = application_notice_embed(
         f"Question {index}/{len(APPLICATION_QUESTIONS)}",
-        f"**{question}**\n\nReply with your answer in one message. Type `cancel` at any time to stop.",
+        f"**{question}**\n\n{instructions}",
         APPLICATION_PENDING_COLOR,
     )
     return embed
@@ -1048,17 +1042,9 @@ class ApplicationStartView(discord.ui.View):
         answers: list[str] = []
         started_at = utcnow()
         for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
-            await dm.send(embed=application_question_embed(idx, question))
             if idx == len(APPLICATION_QUESTIONS):
                 yes_no_view = YesNoQuestionView(interaction.user.id)
-                await dm.send(
-                    embed=application_notice_embed(
-                        "Choose an Answer",
-                        "Please click one of the buttons below.",
-                        APPLICATION_PENDING_COLOR,
-                    ),
-                    view=yes_no_view,
-                )
+                await dm.send(embed=application_question_embed(idx, question), view=yes_no_view)
                 await yes_no_view.wait()
                 if yes_no_view.answer is None:
                     await dm.send(
@@ -1071,6 +1057,7 @@ class ApplicationStartView(discord.ui.View):
                     return
                 answers.append(yes_no_view.answer)
                 continue
+            await dm.send(embed=application_question_embed(idx, question))
             try:
                 msg = await bot.wait_for(
                     "message",
