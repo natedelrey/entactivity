@@ -1447,11 +1447,26 @@ async def build_activity_report(guild: discord.Guild, wk: str | None = None) -> 
     assert bot.db_pool is not None
     async with bot.db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT discord_id, COALESCE(SUM(minutes), 0)::INT AS minutes FROM roblox_activity WHERE week_key=$1 GROUP BY discord_id",
+            """
+            SELECT
+                COALESCE(v_by_activity_roblox.discord_id, v_by_stored_id.discord_id, a.discord_id) AS discord_id,
+                MAX(COALESCE(v_by_activity_roblox.roblox_username, v_by_discord.roblox_username, v_by_stored_id.roblox_username)) AS roblox_username,
+                COALESCE(SUM(a.minutes), 0)::INT AS minutes
+            FROM roblox_activity a
+            LEFT JOIN roblox_verification v_by_activity_roblox
+                ON a.roblox_id IS NOT NULL AND v_by_activity_roblox.roblox_id = a.roblox_id
+            LEFT JOIN roblox_verification v_by_discord
+                ON v_by_discord.discord_id = a.discord_id
+            LEFT JOIN roblox_verification v_by_stored_id
+                ON v_by_stored_id.roblox_id = a.discord_id
+            WHERE a.week_key=$1
+            GROUP BY 1
+            """,
             wk,
         )
 
     minute_map = {int(row["discord_id"]): int(row["minutes"] or 0) for row in rows}
+    roblox_name_map = {int(row["discord_id"]): row["roblox_username"] for row in rows if row["roblox_username"]}
 
     # Include department role members so no-activity people appear, if configured.
     member_ids: set[int] = set(minute_map.keys())
@@ -1466,7 +1481,7 @@ async def build_activity_report(guild: discord.Guild, wk: str | None = None) -> 
     records = []
     for member_id in sorted(member_ids):
         member = guild.get_member(member_id)
-        name = member.display_name if member else f"Unknown ({member_id})"
+        name = member.display_name if member else roblox_name_map.get(member_id, f"Unknown ({member_id})")
         minutes = minute_map.get(member_id, 0)
         line = f"**{name}** — {fmt_minutes(minutes)}/{fmt_minutes(CONFIG.weekly_time_requirement)}"
         records.append({"discord_id": member_id, "name": name, "minutes": minutes})
@@ -1543,10 +1558,19 @@ async def activity_leaderboard(interaction: discord.Interaction) -> None:
     async with bot.db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT discord_id, COALESCE(SUM(minutes), 0)::INT AS minutes
-            FROM roblox_activity
-            WHERE week_key=$1
-            GROUP BY discord_id
+            SELECT
+                COALESCE(v_by_activity_roblox.discord_id, v_by_stored_id.discord_id, a.discord_id) AS discord_id,
+                MAX(COALESCE(v_by_activity_roblox.roblox_username, v_by_discord.roblox_username, v_by_stored_id.roblox_username)) AS roblox_username,
+                COALESCE(SUM(a.minutes), 0)::INT AS minutes
+            FROM roblox_activity a
+            LEFT JOIN roblox_verification v_by_activity_roblox
+                ON a.roblox_id IS NOT NULL AND v_by_activity_roblox.roblox_id = a.roblox_id
+            LEFT JOIN roblox_verification v_by_discord
+                ON v_by_discord.discord_id = a.discord_id
+            LEFT JOIN roblox_verification v_by_stored_id
+                ON v_by_stored_id.roblox_id = a.discord_id
+            WHERE a.week_key=$1
+            GROUP BY 1
             ORDER BY minutes DESC
             LIMIT 10
             """,
@@ -1559,7 +1583,7 @@ async def activity_leaderboard(interaction: discord.Interaction) -> None:
     medals = ["🥇", "🥈", "🥉"]
     for idx, row in enumerate(rows, start=1):
         member = interaction.guild.get_member(int(row["discord_id"])) if interaction.guild else None
-        name = member.display_name if member else f"Unknown ({row['discord_id']})"
+        name = member.display_name if member else (row["roblox_username"] or f"Unknown ({row['discord_id']})")
         prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
         lines.append(f"{prefix} **{name}** — {fmt_minutes(int(row['minutes']))}")
     embed = discord.Embed(
