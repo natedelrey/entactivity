@@ -229,6 +229,7 @@ intents.message_content = False
 
 activity_group = app_commands.Group(name="activity", description=f"{CONFIG.department_abbrev} activity tracking commands.")
 strikes_group = app_commands.Group(name="strikes", description=f"{CONFIG.department_abbrev} strike management commands.")
+verification_group = app_commands.Group(name="verification", description=f"{CONFIG.department_abbrev} verification management commands.")
 
 
 def is_default_role(role: discord.Role) -> bool:
@@ -277,6 +278,10 @@ class ETBot(commands.Bot):
                 pass
             try:
                 self.tree.add_command(strikes_group)
+            except app_commands.CommandAlreadyRegistered:
+                pass
+            try:
+                self.tree.add_command(verification_group)
             except app_commands.CommandAlreadyRegistered:
                 pass
 
@@ -1428,6 +1433,81 @@ async def verify(interaction: discord.Interaction, roblox_username: str) -> None
         CONFIG.department_color,
     )
     await interaction.followup.send(f"Successfully verified as **{roblox_name}**.", ephemeral=True)
+
+
+# ============================================================
+# /verification commands
+# ============================================================
+
+@verification_group.command(name="audit", description="(Mgmt) List department role members who have not verified yet.")
+async def verification_audit(interaction: discord.Interaction) -> None:
+    if not await require_db(interaction):
+        return
+    if not isinstance(interaction.user, discord.Member) or not can_manage_activity(interaction.user):
+        await interaction.response.send_message("You do not have permission to run verification audits.", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("Verification audits can only be run in the server.", ephemeral=True)
+        return
+    if not CONFIG.department_role_id:
+        await interaction.response.send_message("DEPARTMENT_ROLE_ID is not configured, so I cannot audit department members.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    role = interaction.guild.get_role(CONFIG.department_role_id)
+    if not role:
+        await interaction.followup.send("I could not find the configured department role in this server.", ephemeral=True)
+        return
+
+    try:
+        await interaction.guild.chunk(cache=True)
+    except Exception:
+        # Continue with the members currently cached for the role.
+        pass
+
+    department_members = [member for member in role.members if not member.bot]
+    member_ids = [member.id for member in department_members]
+
+    verified_ids: set[int] = set()
+    if member_ids:
+        async with bot.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT discord_id FROM roblox_verification WHERE discord_id = ANY($1::bigint[])",
+                member_ids,
+            )
+        verified_ids = {int(row["discord_id"]) for row in rows}
+
+    unverified = sorted(
+        (member for member in department_members if member.id not in verified_ids),
+        key=lambda member: member.display_name.lower(),
+    )
+
+    if unverified:
+        lines = [f"{idx}. {member.mention} (`{member.id}`)" for idx, member in enumerate(unverified[:50], start=1)]
+        if len(unverified) > 50:
+            lines.append(f"…and {len(unverified) - 50} more.")
+        description = "\n".join(lines)
+    else:
+        description = "All cached department role members have verified with the bot."
+
+    embed = discord.Embed(
+        title=f"{CONFIG.department_abbrev} Verification Audit",
+        description=description,
+        color=CONFIG.department_color,
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Department Role", value=role.mention, inline=True)
+    embed.add_field(name="Members Checked", value=str(len(department_members)), inline=True)
+    embed.add_field(name="Unverified", value=str(len(unverified)), inline=True)
+    embed.set_footer(text=CONFIG.department_name)
+
+    await bot.log_command(
+        "Verification Audit Run",
+        f"By: {interaction.user.mention}\nRole: {role.mention}\nMembers checked: **{len(department_members)}**\nUnverified: **{len(unverified)}**",
+        CONFIG.department_color,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ============================================================
