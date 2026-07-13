@@ -2025,24 +2025,34 @@ async def weekly_scheduler() -> None:
         )
         if existing:
             return
-    for guild in bot.guilds:
-        channel = bot.get_channel(CONFIG.weekly_report_channel_id) if CONFIG.weekly_report_channel_id else None
-        if CONFIG.auto_weekly_report and channel:
-            embed, snapshot = await build_activity_report(guild, marker_week)
-            await channel.send(embed=embed)
-            async with bot.db_pool.acquire() as conn:
-                snapshot["auto_marker"] = "true"
-                await conn.execute(
-                    "INSERT INTO weekly_snapshots (week_key, report_json, created_by) VALUES ($1, $2, NULL)",
-                    marker_week,
-                    json.dumps(snapshot),
-                )
-            await bot.log_command("Auto Weekly Report Posted", f"Week: **{marker_week}**", CONFIG.department_color)
-        if CONFIG.auto_weekly_reset:
-            async with bot.db_pool.acquire() as conn:
-                await conn.execute("DELETE FROM roblox_activity WHERE week_key=$1", marker_week)
-                await conn.execute("DELETE FROM roblox_sessions")
-            await bot.log_command("Auto Weekly Activity Reset", f"Week: **{marker_week}**", discord.Color.orange())
+    channel = bot.get_channel(CONFIG.weekly_report_channel_id) if CONFIG.weekly_report_channel_id else None
+    report_guild = getattr(channel, "guild", None) or (bot.guilds[0] if bot.guilds else None)
+    snapshot: dict[str, Any] = {"week_key": marker_week}
+    action_performed = False
+
+    if CONFIG.auto_weekly_report and channel and report_guild:
+        embed, snapshot = await build_activity_report(report_guild, marker_week)
+        await channel.send(embed=embed)
+        action_performed = True
+        await bot.log_command("Auto Weekly Report Posted", f"Week: **{marker_week}**", CONFIG.department_color)
+
+    if CONFIG.auto_weekly_reset:
+        async with bot.db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM roblox_activity WHERE week_key=$1", marker_week)
+            await conn.execute("DELETE FROM roblox_sessions")
+        action_performed = True
+        await bot.log_command("Auto Weekly Activity Reset", f"Week: **{marker_week}**", discord.Color.orange())
+
+    if not action_performed:
+        return
+
+    async with bot.db_pool.acquire() as conn:
+        snapshot["auto_marker"] = "true"
+        await conn.execute(
+            "INSERT INTO weekly_snapshots (week_key, report_json, created_by) VALUES ($1, $2, NULL)",
+            marker_week,
+            json.dumps(snapshot),
+        )
 
 
 # ============================================================
