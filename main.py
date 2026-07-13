@@ -540,7 +540,16 @@ class ETBot(commands.Bot):
     async def fetch_weekly_minutes(self, conn: asyncpg.Connection, discord_id: int, wk: str | None = None) -> int:
         wk = wk or week_key()
         value = await conn.fetchval(
-            "SELECT COALESCE(SUM(minutes), 0)::INT FROM roblox_activity WHERE discord_id=$1 AND week_key=$2",
+            """
+            SELECT COALESCE(SUM(a.minutes), 0)::INT
+            FROM roblox_activity a
+            LEFT JOIN roblox_verification v_by_activity_roblox
+                ON a.roblox_id IS NOT NULL AND v_by_activity_roblox.roblox_id = a.roblox_id
+            LEFT JOIN roblox_verification v_by_stored_id
+                ON v_by_stored_id.roblox_id = a.discord_id
+            WHERE COALESCE(v_by_activity_roblox.discord_id, v_by_stored_id.discord_id, a.discord_id)=$1
+                AND a.week_key=$2
+            """,
             discord_id,
             wk,
         )
@@ -548,7 +557,15 @@ class ETBot(commands.Bot):
 
     async def fetch_all_time_minutes(self, conn: asyncpg.Connection, discord_id: int) -> int:
         value = await conn.fetchval(
-            "SELECT COALESCE(SUM(minutes), 0)::INT FROM roblox_activity WHERE discord_id=$1",
+            """
+            SELECT COALESCE(SUM(a.minutes), 0)::INT
+            FROM roblox_activity a
+            LEFT JOIN roblox_verification v_by_activity_roblox
+                ON a.roblox_id IS NOT NULL AND v_by_activity_roblox.roblox_id = a.roblox_id
+            LEFT JOIN roblox_verification v_by_stored_id
+                ON v_by_stored_id.roblox_id = a.discord_id
+            WHERE COALESCE(v_by_activity_roblox.discord_id, v_by_stored_id.discord_id, a.discord_id)=$1
+            """,
             discord_id,
         )
         return int(value or 0)
