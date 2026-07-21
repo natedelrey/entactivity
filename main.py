@@ -16,6 +16,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -91,6 +92,26 @@ def week_key(date: dt.datetime | None = None) -> str:
     return f"{iso.year}-W{iso.week:02d}"
 
 
+TASK_WEEKDAY_UTC = 6  # Sunday
+TASK_WEEK_HOUR_UTC = 4
+
+
+def task_week_start(date: dt.datetime | None = None) -> dt.datetime:
+    """Return the 04:00 UTC Sunday that owns *date*."""
+    current = (date or utcnow()).astimezone(UTC)
+    days_since_sunday = (current.weekday() - TASK_WEEKDAY_UTC) % 7
+    start = (current - dt.timedelta(days=days_since_sunday)).replace(
+        hour=TASK_WEEK_HOUR_UTC, minute=0, second=0, microsecond=0
+    )
+    if current < start:
+        start -= dt.timedelta(days=7)
+    return start
+
+
+def task_week_key(date: dt.datetime | None = None) -> str:
+    return task_week_start(date).strftime("%Y-%m-%d")
+
+
 def normalize_base_url(url: str | None) -> str | None:
     if not url:
         return None
@@ -156,6 +177,11 @@ class BotConfig:
     roblox_audit_log_channel_id: int | None = getenv_int("ROBLOX_AUDIT_LOG_CHANNEL_ID")
     welcome_channel_id: int | None = getenv_int("WELCOME_CHANNEL_ID")
     weekly_report_channel_id: int | None = getenv_int("WEEKLY_REPORT_CHANNEL_ID")
+
+    # Approved task log dashboard
+    task_log_channel_id: int = getenv_int("TASK_LOG_CHANNEL_ID", 1520165321951023304) or 1520165321951023304
+    task_report_channel_id: int = getenv_int("TASK_REPORT_CHANNEL_ID", 1528989401051299840) or 1528989401051299840
+    task_log_after_message_id: int = getenv_int("TASK_LOG_AFTER_MESSAGE_ID", 1529006704279158855) or 1529006704279158855
 
     # Roles
     management_role_id: int | None = getenv_int("MANAGEMENT_ROLE_ID")
@@ -225,7 +251,8 @@ CONFIG = BotConfig()
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = False
+intents.message_content = True
+intents.reactions = True
 
 activity_group = app_commands.Group(name="activity", description=f"{CONFIG.department_abbrev} activity tracking commands.")
 strikes_group = app_commands.Group(name="strikes", description=f"{CONFIG.department_abbrev} strike management commands.")
@@ -245,6 +272,8 @@ class ETBot(commands.Bot):
         self._bootstrap_lock = asyncio.Lock()
         self._bootstrapped = False
         self._application_views_registered = False
+        self._task_dashboard_lock = asyncio.Lock()
+        self._task_logs_reconciled = False
 
     async def setup_hook(self) -> None:
         if not CONFIG.database_url:
@@ -387,6 +416,27 @@ class ETBot(commands.Bot):
                     panel_key TEXT PRIMARY KEY,
                     channel_id BIGINT NOT NULL,
                     message_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS approved_task_logs (
+                    message_id BIGINT PRIMARY KEY,
+                    week_key TEXT NOT NULL,
+                    member_id BIGINT NOT NULL,
+                    member_name TEXT NOT NULL,
+                    rank_name TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    approved_by BIGINT,
+                    approved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS task_week_dashboards (
+                    week_key TEXT PRIMARY KEY,
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    announced BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
             """)
@@ -658,6 +708,178 @@ async def require_db(interaction: discord.Interaction) -> bool:
 
 
 # ============================================================
+# Approved task log dashboard
+# ============================================================
+
+TASK_RANKS: tuple[tuple[int, str], ...] = (
+    (1520155507246104786, "Senior Engineer"),
+    (1520155509473284097, "Engineer"),
+    (1520155511515779172, "Senior Technician"),
+    (1520155515244642334, "Technician"),
+    (1520155517572354248, "Junior Technician"),
+    (1520155520546111620, "Junior Technician"),
+)
+TASK_TYPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Pipe Repairs", ("pipe repairs", "pipe repair")),
+    ("Door Repair", ("door repair", "door repairs")),
+    ("Generator Check", ("generator check", "generator checks")),
+    ("Generator Repair", ("generator repair", "generator repairs")),
+    ("Alarm Test", ("alarm test", "alarm tests")),
+    ("Sector Sweep", ("sector sweep", "sector sweeps")),
+    ("SCP Containment Zone Check", ("scp containment zone check", "containment zone check")),
+)
+TASK_APPROVAL_EMOJI = {"✅", "☑️", "☑", "✔️", "✔", "🟢", "💚"}
+
+
+def is_task_approval_emoji(emoji: Any) -> bool:
+    rendered = str(emoji)
+    name = (getattr(emoji, "name", None) or rendered).casefold().replace("_", " ").replace("-", " ")
+    return rendered in TASK_APPROVAL_EMOJI or any(word in name for word in ("approve", "check", "green"))
+
+
+def extract_task_type(message: discord.Message) -> str | None:
+    sections = [message.content]
+    for embed in message.embeds:
+        sections.extend((embed.title or "", embed.description or ""))
+        sections.extend(f"{field.name}\n{field.value}" for field in embed.fields)
+    text = re.sub(r"[*_`~]", "", "\n".join(sections)).casefold()
+    for task_type, aliases in TASK_TYPES:
+        if any(re.search(rf"\b{re.escape(alias)}\b", text) for alias in aliases):
+            return task_type
+    return None
+
+
+async def task_log_member(message: discord.Message) -> tuple[discord.Member, str] | None:
+    candidates: list[discord.Member] = list(message.mentions)
+    if isinstance(message.author, discord.Member):
+        candidates.append(message.author)
+    # Webhook/form embeds often contain a raw member ID rather than a real mention.
+    raw_sections = [message.content]
+    for embed in message.embeds:
+        raw_sections.extend((embed.title or "", embed.description or ""))
+        raw_sections.extend(f"{field.name}\n{field.value}" for field in embed.fields)
+    raw = "\n".join(raw_sections)
+    for member_id in dict.fromkeys(int(value) for value in re.findall(r"(?<!\d)(\d{17,20})(?!\d)", raw)):
+        member = message.guild.get_member(member_id) if message.guild else None
+        if member is None and message.guild:
+            try:
+                member = await message.guild.fetch_member(member_id)
+            except discord.HTTPException:
+                pass
+        if member:
+            candidates.append(member)
+    for member in dict.fromkeys(candidates):
+        role_ids = {role.id for role in member.roles}
+        for role_id, rank_name in TASK_RANKS:
+            if role_id in role_ids:
+                return member, rank_name
+    return None
+
+
+def build_task_dashboard(rows: list[asyncpg.Record], start: dt.datetime) -> discord.Embed:
+    end = start + dt.timedelta(days=6)
+    total = len(rows)
+    task_counts = {name: 0 for name, _ in TASK_TYPES}
+    rank_members: dict[str, dict[str, int]] = {name: {} for _, name in TASK_RANKS}
+    for row in rows:
+        task_counts[row["task_type"]] += 1
+        members = rank_members[row["rank_name"]]
+        members[row["member_name"]] = members.get(row["member_name"], 0) + 1
+    task_lines = [f"{total} total tasks logged"]
+    for task_type, _ in TASK_TYPES:
+        count = task_counts[task_type]
+        percentage = count / total * 100 if total else 0
+        task_lines.append(f"**{task_type}** - {count} ({percentage:.0f}%)")
+    embed = discord.Embed(
+        title=f"<:ent:1521597138079846603> Week Of {start:%m/%d/%Y}",
+        description=(
+            f"This data is consistently updated throughout ({start:%m/%d} - {end:%m/%d}). "
+            "Whenever you approve a log, it is updated here. A new embed for each week will be posted."
+        ),
+        color=10192968,
+    )
+    embed.add_field(name="Task Data", value="\n".join(task_lines), inline=False)
+    for rank in ("Junior Technician", "Technician", "Senior Technician", "Engineer", "Senior Engineer"):
+        members = rank_members[rank]
+        value = "\n".join(f"**{name}** - {count} tasks" for name, count in sorted(members.items(), key=lambda item: (-item[1], item[0].casefold())))
+        embed.add_field(name=rank, value=value or "No tasks logged", inline=True)
+    return embed
+
+
+async def update_task_dashboard(week: str, *, announce: bool = False) -> None:
+    if not bot.db_pool:
+        return
+    async with bot._task_dashboard_lock:
+        channel = bot.get_channel(CONFIG.task_report_channel_id)
+        log_channel = bot.get_channel(CONFIG.task_log_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        start = dt.datetime.strptime(week, "%Y-%m-%d").replace(tzinfo=UTC, hour=TASK_WEEK_HOUR_UTC)
+        async with bot.db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM approved_task_logs WHERE week_key=$1 ORDER BY approved_at", week)
+            dashboard = await conn.fetchrow("SELECT * FROM task_week_dashboards WHERE week_key=$1", week)
+        embed = build_task_dashboard(rows, start)
+        message = None
+        if dashboard:
+            try:
+                message = await channel.fetch_message(dashboard["message_id"])
+            except discord.HTTPException:
+                pass
+        if message:
+            await message.edit(embed=embed)
+        else:
+            message = await channel.send(embed=embed)
+            async with bot.db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO task_week_dashboards (week_key, channel_id, message_id) VALUES ($1,$2,$3) "
+                    "ON CONFLICT (week_key) DO UPDATE SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id",
+                    week, channel.id, message.id,
+                )
+        if announce and isinstance(log_channel, discord.TextChannel):
+            async with bot.db_pool.acquire() as conn:
+                should_announce = await conn.fetchval(
+                    "UPDATE task_week_dashboards SET announced=TRUE WHERE week_key=$1 AND announced=FALSE RETURNING TRUE", week
+                )
+            if should_announce:
+                week_number = start.isocalendar().week
+                await log_channel.send(f"<:et:1521597138079846603> Week {week_number} tasks logged below.")
+
+
+async def record_approved_task(message: discord.Message, approved_by: int | None) -> None:
+    if not bot.db_pool:
+        return
+    async with bot.db_pool.acquire() as conn:
+        if await conn.fetchval("SELECT 1 FROM approved_task_logs WHERE message_id=$1", message.id):
+            return
+    task_type = extract_task_type(message)
+    member_rank = await task_log_member(message)
+    if not task_type or not member_rank:
+        print(f"[Tasks] Ignored approved log {message.id}: task type or eligible member not found.")
+        return
+    member, rank_name = member_rank
+    week = task_week_key(message.created_at)
+    async with bot.db_pool.acquire() as conn:
+        inserted = await conn.fetchval(
+            """INSERT INTO approved_task_logs
+               (message_id, week_key, member_id, member_name, rank_name, task_type, approved_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING message_id""",
+            message.id, week, member.id, member.display_name, rank_name, task_type, approved_by,
+        )
+    if inserted:
+        await update_task_dashboard(week)
+
+
+async def reconcile_approved_tasks() -> None:
+    channel = bot.get_channel(CONFIG.task_log_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    boundary = discord.Object(id=CONFIG.task_log_after_message_id)
+    async for message in channel.history(limit=None, after=boundary, oldest_first=True):
+        if any(is_task_approval_emoji(reaction.emoji) for reaction in message.reactions):
+            await record_approved_task(message, None)
+
+
+# ============================================================
 # Events
 # ============================================================
 
@@ -671,7 +893,30 @@ async def on_ready() -> None:
         bot._application_views_registered = True
     await ensure_application_panel()
     if CONFIG.auto_weekly_report or CONFIG.auto_weekly_reset:
-        weekly_scheduler.start()
+        if not weekly_scheduler.is_running():
+            weekly_scheduler.start()
+    if not task_dashboard_scheduler.is_running():
+        task_dashboard_scheduler.start()
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if (
+        payload.channel_id != CONFIG.task_log_channel_id
+        or payload.message_id <= CONFIG.task_log_after_message_id
+        or not is_task_approval_emoji(payload.emoji)
+        or not bot.db_pool
+        or payload.user_id == getattr(bot.user, "id", None)
+    ):
+        return
+    channel = bot.get_channel(payload.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+    await record_approved_task(message, payload.user_id)
 
 
 @bot.tree.error
@@ -2025,6 +2270,20 @@ async def welcome(interaction: discord.Interaction, member: discord.Member, chan
 # ============================================================
 # Optional weekly scheduler
 # ============================================================
+
+@tasks.loop(minutes=5)
+async def task_dashboard_scheduler() -> None:
+    """Create each dashboard and boundary announcement exactly once."""
+    if bot.db_pool:
+        await update_task_dashboard(task_week_key(), announce=True)
+        if not bot._task_logs_reconciled:
+            await reconcile_approved_tasks()
+            bot._task_logs_reconciled = True
+
+
+@task_dashboard_scheduler.before_loop
+async def before_task_dashboard_scheduler() -> None:
+    await bot.wait_until_ready()
 
 @tasks.loop(minutes=30)
 async def weekly_scheduler() -> None:
