@@ -112,6 +112,15 @@ def task_week_key(date: dt.datetime | None = None) -> str:
     return task_week_start(date).strftime("%Y-%m-%d")
 
 
+def task_week_number(start: dt.datetime) -> int:
+    """Return the Sunday-based calendar week number, counting Jan 1 as week 1."""
+    return int(start.strftime("%U")) + 1
+
+
+def short_date(date: dt.datetime) -> str:
+    return f"{date.month}/{date.day}"
+
+
 def normalize_base_url(url: str | None) -> str | None:
     if not url:
         return None
@@ -778,6 +787,7 @@ async def task_log_member(message: discord.Message) -> tuple[discord.Member, str
 
 def build_task_dashboard(rows: list[asyncpg.Record], start: dt.datetime) -> discord.Embed:
     end = start + dt.timedelta(days=6)
+    week_number = task_week_number(start)
     total = len(rows)
     task_counts = {name: 0 for name, _ in TASK_TYPES}
     rank_members: dict[str, dict[str, int]] = {name: {} for _, name in TASK_RANKS}
@@ -791,7 +801,7 @@ def build_task_dashboard(rows: list[asyncpg.Record], start: dt.datetime) -> disc
         percentage = count / total * 100 if total else 0
         task_lines.append(f"**{task_type}** - {count} ({percentage:.0f}%)")
     embed = discord.Embed(
-        title=f"<:ent:1521597138079846603> Week Of {start:%m/%d/%Y}",
+        title=f"<:ent:1521597138079846603> Week {week_number} ({short_date(start)}-{short_date(end)})",
         description=(
             f"This data is consistently updated throughout ({start:%m/%d} - {end:%m/%d}). "
             "Whenever you approve a log, it is updated here. A new embed for each week will be posted."
@@ -841,7 +851,7 @@ async def update_task_dashboard(week: str, *, announce: bool = False) -> None:
                     "UPDATE task_week_dashboards SET announced=TRUE WHERE week_key=$1 AND announced=FALSE RETURNING TRUE", week
                 )
             if should_announce:
-                week_number = start.isocalendar().week
+                week_number = task_week_number(start)
                 await log_channel.send(f"<:et:1521597138079846603> Week {week_number} tasks logged below.")
 
 
