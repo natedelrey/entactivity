@@ -869,12 +869,23 @@ async def record_approved_task(message: discord.Message, approved_by: int | None
     member, rank_name = member_rank
     week = task_week_key(message.created_at)
     async with bot.db_pool.acquire() as conn:
-        inserted = await conn.fetchval(
-            """INSERT INTO approved_task_logs
-               (message_id, week_key, member_id, member_name, rank_name, task_type, approved_by)
-               VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING message_id""",
-            message.id, week, member.id, member.display_name, rank_name, task_type, approved_by,
-        )
+        async with conn.transaction():
+            # The dashboard groups a member's weekly total under one rank. If their
+            # role changed since an earlier log, carry those tasks into the rank
+            # they hold when their newest task is approved.
+            await conn.execute(
+                """UPDATE approved_task_logs
+                   SET rank_name=$1, member_name=$2
+                   WHERE week_key=$3 AND member_id=$4
+                     AND (rank_name IS DISTINCT FROM $1 OR member_name IS DISTINCT FROM $2)""",
+                rank_name, member.display_name, week, member.id,
+            )
+            inserted = await conn.fetchval(
+                """INSERT INTO approved_task_logs
+                   (message_id, week_key, member_id, member_name, rank_name, task_type, approved_by)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING message_id""",
+                message.id, week, member.id, member.display_name, rank_name, task_type, approved_by,
+            )
     if inserted:
         await update_task_dashboard(week)
 
