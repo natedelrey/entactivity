@@ -1722,6 +1722,122 @@ async def verify(interaction: discord.Interaction, roblox_username: str) -> None
 # /verification commands
 # ============================================================
 
+def can_manage_verifications(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and can_manage_activity(interaction.user)
+
+
+@verification_group.command(name="update", description="(Mgmt) Change the Roblox account linked to a member.")
+@app_commands.describe(member="Member whose link should be changed", roblox_username="Exact Roblox username to link")
+async def verification_update(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    roblox_username: str,
+) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_verifications(interaction):
+        await interaction.response.send_message("You do not have permission to edit verifications.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await lookup_roblox_user(roblox_username)
+    if not result:
+        await interaction.followup.send("I could not find that Roblox username.", ephemeral=True)
+        return
+    roblox_id, roblox_name = result
+
+    async with bot.db_pool.acquire() as conn:
+        existing_owner = await conn.fetchrow(
+            "SELECT discord_id FROM roblox_verification WHERE roblox_id=$1 AND discord_id<>$2",
+            roblox_id,
+            member.id,
+        )
+        if existing_owner:
+            owner_id = int(existing_owner["discord_id"])
+            await interaction.followup.send(
+                f"**{roblox_name}** is already linked to <@{owner_id}> (`{owner_id}`). Remove that link first.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            async with conn.transaction():
+                previous = await conn.fetchrow(
+                    "SELECT roblox_id, roblox_username FROM roblox_verification WHERE discord_id=$1 FOR UPDATE",
+                    member.id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO roblox_verification (discord_id, roblox_id, roblox_username, verified_at)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (discord_id)
+                    DO UPDATE SET roblox_id=EXCLUDED.roblox_id,
+                                  roblox_username=EXCLUDED.roblox_username,
+                                  verified_at=EXCLUDED.verified_at
+                    """,
+                    member.id,
+                    roblox_id,
+                    roblox_name,
+                    utcnow(),
+                )
+                if previous and int(previous["roblox_id"]) != roblox_id:
+                    await conn.execute("DELETE FROM roblox_sessions WHERE roblox_id=$1", int(previous["roblox_id"]))
+        except asyncpg.UniqueViolationError:
+            await interaction.followup.send(
+                f"**{roblox_name}** was linked to another member while this command was running.",
+                ephemeral=True,
+            )
+            return
+
+    old_link = (
+        f"**{previous['roblox_username'] or 'Unknown'}** (`{previous['roblox_id']}`)"
+        if previous
+        else "Not previously verified"
+    )
+    await bot.log_command(
+        "Verification Updated by Management",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nPrevious: {old_link}\nNew: **{roblox_name}** (`{roblox_id}`)",
+        CONFIG.department_color,
+    )
+    await interaction.followup.send(
+        f"Updated {member.mention}'s verified Roblox account to **{roblox_name}** (`{roblox_id}`).",
+        ephemeral=True,
+    )
+
+
+@verification_group.command(name="remove", description="(Mgmt) Remove a member's linked Roblox account.")
+@app_commands.describe(member="Member whose Roblox link should be removed")
+async def verification_remove(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not await require_db(interaction):
+        return
+    if not can_manage_verifications(interaction):
+        await interaction.response.send_message("You do not have permission to edit verifications.", ephemeral=True)
+        return
+
+    async with bot.db_pool.acquire() as conn:
+        async with conn.transaction():
+            previous = await conn.fetchrow(
+                "DELETE FROM roblox_verification WHERE discord_id=$1 RETURNING roblox_id, roblox_username",
+                member.id,
+            )
+            if previous:
+                await conn.execute("DELETE FROM roblox_sessions WHERE roblox_id=$1", int(previous["roblox_id"]))
+
+    if not previous:
+        await interaction.response.send_message(f"{member.mention} does not have a verified Roblox account.", ephemeral=True)
+        return
+
+    await bot.log_command(
+        "Verification Removed by Management",
+        f"By: {interaction.user.mention}\nMember: {member.mention}\nRemoved: **{previous['roblox_username'] or 'Unknown'}** (`{previous['roblox_id']}`)",
+        discord.Color.orange(),
+    )
+    await interaction.response.send_message(
+        f"Removed **{previous['roblox_username'] or 'Unknown'}** (`{previous['roblox_id']}`) from {member.mention}.",
+        ephemeral=True,
+    )
+
+
 @verification_group.command(name="audit", description="(Mgmt) List department role members who have not verified yet.")
 async def verification_audit(interaction: discord.Interaction) -> None:
     if not await require_db(interaction):
