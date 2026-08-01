@@ -736,6 +736,7 @@ TASK_TYPES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Alarm Test", ("alarm test", "alarm tests")),
     ("Sector Sweep", ("sector sweep", "sector sweeps")),
     ("SCP Containment Zone Check", ("scp containment zone check", "containment zone check")),
+    ("Fuel Rod Replenishment", ("fuel rod replenishment", "fuel rod replenishments")),
 )
 TASK_APPROVAL_EMOJI = {"✅", "☑️", "☑", "✔️", "✔", "🟢", "💚"}
 
