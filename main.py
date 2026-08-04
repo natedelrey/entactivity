@@ -208,6 +208,8 @@ class BotConfig:
     application_dm_help_channel_id: int = getenv_int("APPLICATION_DM_HELP_CHANNEL_ID", 1520162557774532649) or 1520162557774532649
     application_ticket_category_id: int = getenv_int("APPLICATION_TICKET_CATEGORY_ID", 1521669739414290462) or 1521669739414290462
     application_management_role_ids: tuple[int, ...] = (1520155690587390082, 1520155715455549530)
+    certificate_application_channel_id: int = getenv_int("CERTIFICATE_APPLICATION_CHANNEL_ID", 1534232143470002337) or 1534232143470002337
+    nuclear_certificate_role_id: int = getenv_int("NUCLEAR_CERTIFICATE_ROLE_ID", 1534196047205765200) or 1534196047205765200
 
     # Roblox service/webhooks
     api_secret_key: str | None = getenv_str("API_SECRET_KEY")
@@ -420,6 +422,7 @@ class ETBot(commands.Bot):
             """)
             await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_duration_seconds INT;")
             await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS applicant_joined_at TIMESTAMPTZ;")
+            await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_type TEXT NOT NULL DEFAULT 'entry';")
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_panels (
                     panel_key TEXT PRIMARY KEY,
@@ -912,8 +915,11 @@ async def on_ready() -> None:
         bot.add_view(ApplicationStartView())
         bot.add_view(ApplicationReviewView())
         bot.add_view(ApplicationTicketView())
+        bot.add_view(CertificateApplicationStartView())
+        bot.add_view(CertificateApplicationReviewView())
         bot._application_views_registered = True
     await ensure_application_panel()
+    await ensure_certificate_application_panel()
     if CONFIG.auto_weekly_report or CONFIG.auto_weekly_reset:
         if not weekly_scheduler.is_running():
             weekly_scheduler.start()
@@ -1044,6 +1050,12 @@ APPLICATION_QUESTIONS = [
     "Do you understand that all new members must complete the Internship Program within 2 weeks before becoming a full member of the department?",
 ]
 
+NUCLEAR_CERTIFICATE_QUESTIONS = [
+    "What is the difference between a Lighting Test and Stress Test?",
+    "Describe how you would go about conducting a Lighting Test.",
+    "Give a suggestion for a feature you'd like to see added to the Nuclear Certificate.",
+]
+
 APPLICATION_START_COLOR = discord.Color.gold()
 APPLICATION_PENDING_COLOR = discord.Color(0xA1904A)
 APPLICATION_ACCEPTED_COLOR = discord.Color.green()
@@ -1075,6 +1087,21 @@ def application_panel_embed() -> discord.Embed:
         color=APPLICATION_START_COLOR,
         timestamp=utcnow(),
     )
+    return embed
+
+
+def certificate_application_panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="☢️ Certificate Applications",
+        description=(
+            "Select an available certificate application below.\n\n"
+            "**Currently available:** Nuclear Certificate\n\n"
+            "Your questions will be sent by DM and your completed application will be reviewed by management."
+        ),
+        color=APPLICATION_START_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.set_footer(text=CONFIG.department_name)
     return embed
 
 
@@ -1159,6 +1186,43 @@ def build_application_embed(
     return embed
 
 
+def build_certificate_application_embed(
+    app_id: int,
+    applicant: discord.abc.User,
+    answers: list[str],
+    status: str = "Pending",
+    *,
+    duration_seconds: int | None = None,
+    joined_guild_at: dt.datetime | None = None,
+    submitted_at: dt.datetime | None = None,
+) -> discord.Embed:
+    normalized_status = status.lower()
+    color = APPLICATION_ACCEPTED_COLOR if normalized_status == "accepted" else (
+        APPLICATION_DENIED_COLOR if normalized_status == "denied" else APPLICATION_PENDING_COLOR
+    )
+    status_icon = {"accepted": "✅", "denied": "❌"}.get(normalized_status, "🕒")
+    embed = discord.Embed(
+        title=f"{status_icon} Nuclear Certificate Application #{app_id} — {status}",
+        description=f"**Applicant:** {applicant.mention} (`{applicant.id}`)",
+        color=color,
+        timestamp=utcnow(),
+    )
+    embed.add_field(
+        name="📊 Submission Stats",
+        value=(
+            f"**UserId:** `{applicant.id}`\n**Username:** `{applicant.name}`\n"
+            f"**User:** {applicant.mention}\n**Duration:** {format_duration(duration_seconds)}\n"
+            f"**Joined guild:** {format_datetime(joined_guild_at)}\n**Submitted:** {format_datetime(submitted_at)}"
+        ),
+        inline=False,
+    )
+    for idx, question in enumerate(NUCLEAR_CERTIFICATE_QUESTIONS, start=1):
+        answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
+        embed.add_field(name=f"❔ Q{idx}: {question}", value=answer[:1024], inline=False)
+    embed.set_footer(text=CONFIG.department_name)
+    return embed
+
+
 def build_application_ticket_embed(
     app_id: int,
     applicant: discord.abc.User,
@@ -1177,14 +1241,18 @@ def build_application_ticket_embed(
     return embed
 
 
-def build_application_preview_embed(answers: list[str]) -> discord.Embed:
+def build_application_preview_embed(
+    answers: list[str],
+    questions: list[str] = APPLICATION_QUESTIONS,
+    title: str = "[E&T] Application",
+) -> discord.Embed:
     embed = discord.Embed(
-        title="📝 [E&T] Application Submission Preview",
+        title=f"📝 {title} Submission Preview",
         description="Review your answers below. Use an edit button to change a specific answer, or submit when everything looks correct.",
         color=APPLICATION_PENDING_COLOR,
         timestamp=utcnow(),
     )
-    for idx, question in enumerate(APPLICATION_QUESTIONS, start=1):
+    for idx, question in enumerate(questions, start=1):
         answer = answers[idx - 1] if idx - 1 < len(answers) else "No answer provided."
         embed.add_field(name=f"❔ Q{idx}: {question}", value=answer[:1024], inline=False)
     return embed
@@ -1218,13 +1286,21 @@ class YesNoQuestionView(discord.ui.View):
 
 
 class ApplicationPreviewView(discord.ui.View):
-    def __init__(self, user_id: int, answers: list[str]):
+    def __init__(
+        self,
+        user_id: int,
+        answers: list[str],
+        questions: list[str] = APPLICATION_QUESTIONS,
+        title: str = "[E&T] Application",
+    ):
         super().__init__(timeout=900)
         self.user_id = user_id
         self.answers = answers
+        self.questions = questions
+        self.title = title
         self.submitted = False
 
-        for idx in range(len(APPLICATION_QUESTIONS)):
+        for idx in range(len(questions)):
             self.add_item(EditAnswerButton(idx))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1234,7 +1310,7 @@ class ApplicationPreviewView(discord.ui.View):
         return False
 
     async def refresh_preview(self, interaction: discord.Interaction) -> None:
-        await interaction.message.edit(embed=build_application_preview_embed(self.answers), view=self)
+        await interaction.message.edit(embed=build_application_preview_embed(self.answers, self.questions, self.title), view=self)
 
     @discord.ui.button(label="Submit Application", style=discord.ButtonStyle.success, row=4)
     async def submit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1257,9 +1333,9 @@ class EditAnswerButton(discord.ui.Button):
         view = self.view
         if not isinstance(view, ApplicationPreviewView):
             return
-        question = APPLICATION_QUESTIONS[self.question_index]
+        question = view.questions[self.question_index]
         dm = interaction.channel
-        if self.question_index == len(APPLICATION_QUESTIONS) - 1:
+        if view.questions is APPLICATION_QUESTIONS and self.question_index == len(view.questions) - 1:
             yes_no_view = YesNoQuestionView(interaction.user.id)
             await interaction.response.send_message(
                 f"Please choose your new answer for **Q{self.question_index + 1}: {question}**.",
@@ -1451,6 +1527,115 @@ class ApplicationStartView(discord.ui.View):
         )
 
 
+class CertificateApplicationStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Apply for Nuclear Certificate",
+        style=discord.ButtonStyle.success,
+        custom_id="certificate_application:nuclear:begin",
+    )
+    async def begin(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Certificate applications must be started from the server.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            dm = await interaction.user.create_dm()
+            await dm.send(embed=application_notice_embed(
+                "☢️ Nuclear Certificate Application Started",
+                "Please answer each question in one message. Type `cancel` at any time to stop.",
+                APPLICATION_START_COLOR,
+            ))
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I could not DM you. Please enable Direct Messages for this server and try again.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send("I sent you a DM to begin your Nuclear Certificate application.", ephemeral=True)
+        answers: list[str] = []
+        started_at = utcnow()
+        for idx, question in enumerate(NUCLEAR_CERTIFICATE_QUESTIONS, start=1):
+            embed = application_notice_embed(
+                f"Question {idx}/{len(NUCLEAR_CERTIFICATE_QUESTIONS)}",
+                f"**{question}**\n\nReply with your answer in one message. Type `cancel` at any time to stop.",
+                APPLICATION_PENDING_COLOR,
+            )
+            await dm.send(embed=embed)
+            try:
+                msg = await bot.wait_for(
+                    "message",
+                    timeout=900,
+                    check=lambda m: m.author.id == interaction.user.id and m.channel.id == dm.id,
+                )
+            except asyncio.TimeoutError:
+                await dm.send(embed=application_notice_embed(
+                    "Application Timed Out", "Please begin the application again when you are ready.", APPLICATION_DENIED_COLOR
+                ))
+                return
+            if msg.content.strip().lower() == "cancel":
+                await dm.send(embed=application_notice_embed(
+                    "Application Cancelled", "Your certificate application has been cancelled.", APPLICATION_DENIED_COLOR
+                ))
+                return
+            answers.append(msg.content.strip()[:3900] or "No answer provided.")
+
+        preview = ApplicationPreviewView(
+            interaction.user.id, answers, NUCLEAR_CERTIFICATE_QUESTIONS, "Nuclear Certificate Application"
+        )
+        await dm.send(
+            embed=build_application_preview_embed(answers, NUCLEAR_CERTIFICATE_QUESTIONS, "Nuclear Certificate Application"),
+            view=preview,
+        )
+        await preview.wait()
+        if not preview.submitted:
+            await dm.send(embed=application_notice_embed(
+                "Preview Timed Out", "Please begin the application again when you are ready.", APPLICATION_DENIED_COLOR
+            ))
+            return
+        if not bot.db_pool:
+            await dm.send(embed=application_notice_embed(
+                "Database Unavailable", "Please contact management for help.", APPLICATION_DENIED_COLOR
+            ))
+            return
+
+        submitted_at = utcnow()
+        duration_seconds = int((submitted_at - started_at).total_seconds())
+        async with bot.db_pool.acquire() as conn:
+            app_id = await conn.fetchval(
+                """INSERT INTO applications
+                   (applicant_id, answers_json, status, application_type, application_duration_seconds,
+                    applicant_joined_at, created_at)
+                   VALUES ($1, $2, 'pending', 'nuclear_certificate', $3, $4, $5) RETURNING id""",
+                interaction.user.id, json.dumps(answers), duration_seconds, interaction.user.joined_at, submitted_at,
+            )
+        channel = bot.get_channel(CONFIG.certificate_application_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await dm.send(embed=application_notice_embed(
+                "Application Saved", "The review channel could not be found. Please contact management.", APPLICATION_DENIED_COLOR
+            ))
+            return
+        sent = await channel.send(
+            embed=build_certificate_application_embed(
+                int(app_id), interaction.user, answers, duration_seconds=duration_seconds,
+                joined_guild_at=interaction.user.joined_at, submitted_at=submitted_at,
+            ),
+            view=CertificateApplicationReviewView(),
+        )
+        async with bot.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE applications SET pending_message_id=$1, pending_channel_id=$2 WHERE id=$3",
+                sent.id, channel.id, int(app_id),
+            )
+        await dm.send(embed=application_notice_embed(
+            "✅ Application Submitted", "Management will review your Nuclear Certificate application.",
+            APPLICATION_ACCEPTED_COLOR,
+        ))
+
+
 class DecisionReasonModal(discord.ui.Modal):
     def __init__(self, app_id: int, accepted: bool):
         super().__init__(title=f"{'Accept' if accepted else 'Deny'} Application #{app_id}")
@@ -1518,6 +1703,46 @@ class ApplicationReviewView(discord.ui.View):
             await open_application_ticket(interaction, app_id)
 
 
+class CertificateApplicationReviewView(ApplicationReviewView):
+    def __init__(self):
+        discord.ui.View.__init__(self, timeout=None)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="certificate_application:accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await process_application_decision(interaction, app_id, True, None)
+
+    @discord.ui.button(label="Accept with Reason", style=discord.ButtonStyle.primary, custom_id="certificate_application:accept_reason")
+    async def accept_reason(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await interaction.response.send_modal(DecisionReasonModal(app_id, True))
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="certificate_application:deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await process_application_decision(interaction, app_id, False, None)
+
+    @discord.ui.button(label="Deny with Reason", style=discord.ButtonStyle.danger, custom_id="certificate_application:deny_reason")
+    async def deny_reason(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await interaction.response.send_modal(DecisionReasonModal(app_id, False))
+
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.secondary, custom_id="certificate_application:ticket")
+    async def ticket(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        del button
+        app_id = self.app_id_from_embed(interaction)
+        if app_id:
+            await open_application_ticket(interaction, app_id)
+
+
 class ApplicationTicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1567,6 +1792,32 @@ async def ensure_application_panel() -> None:
         )
 
 
+async def ensure_certificate_application_panel() -> None:
+    if not bot.db_pool:
+        return
+    channel = bot.get_channel(CONFIG.certificate_application_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT message_id FROM bot_panels WHERE panel_key='certificate_application_start'")
+    if row:
+        try:
+            message = await channel.fetch_message(int(row["message_id"]))
+            await message.edit(embed=certificate_application_panel_embed(), view=CertificateApplicationStartView())
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    message = await channel.send(embed=certificate_application_panel_embed(), view=CertificateApplicationStartView())
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO bot_panels (panel_key, channel_id, message_id)
+               VALUES ('certificate_application_start', $1, $2)
+               ON CONFLICT (panel_key) DO UPDATE
+               SET channel_id=EXCLUDED.channel_id, message_id=EXCLUDED.message_id""",
+            channel.id, message.id,
+        )
+
+
 async def fetch_application(app_id: int) -> asyncpg.Record | None:
     if not bot.db_pool:
         return None
@@ -1598,12 +1849,19 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
         await interaction.response.send_message("That application has already been processed.", ephemeral=True)
         return
     status = "accepted" if accepted else "denied"
-    destination_id = CONFIG.application_accepted_channel_id if accepted else CONFIG.application_denied_channel_id
+    application_type = row["application_type"]
+    is_nuclear_certificate = application_type == "nuclear_certificate"
+    destination_id = (
+        CONFIG.certificate_application_channel_id
+        if is_nuclear_certificate
+        else (CONFIG.application_accepted_channel_id if accepted else CONFIG.application_denied_channel_id)
+    )
     applicant = interaction.guild.get_member(int(row["applicant_id"])) if interaction.guild else bot.get_user(int(row["applicant_id"]))
     if applicant is None:
         applicant = await bot.fetch_user(int(row["applicant_id"]))
     answers = json.loads(row["answers_json"])
-    embed = build_application_embed(
+    embed_builder = build_certificate_application_embed if is_nuclear_certificate else build_application_embed
+    embed = embed_builder(
         app_id,
         applicant,
         answers,
@@ -1627,11 +1885,21 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
             utcnow(),
             app_id,
         )
+    role_granted = False
+    if accepted and is_nuclear_certificate and interaction.guild:
+        member = interaction.guild.get_member(int(row["applicant_id"]))
+        role = interaction.guild.get_role(CONFIG.nuclear_certificate_role_id)
+        if member and role:
+            try:
+                await member.add_roles(role, reason=f"Nuclear Certificate application #{app_id} accepted")
+                role_granted = True
+            except discord.HTTPException:
+                pass
     try:
         await applicant.send(
             embed=application_notice_embed(
                 f"Application {status.title()}",
-                f"Your **[E&T] Entrance Exam** application has been **{status}**."
+                f"Your **{'Nuclear Certificate' if is_nuclear_certificate else '[E&T] Entrance Exam'}** application has been **{status}**."
                 + (f"\n\n**Reason:** {reason}" if reason else ""),
                 APPLICATION_ACCEPTED_COLOR if accepted else APPLICATION_DENIED_COLOR,
             )
@@ -1640,7 +1908,10 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
         pass
     if interaction.message and interaction.message.id != row["pending_message_id"]:
         await interaction.message.edit(view=None)
-    await interaction.response.send_message(f"Application #{app_id} has been {status}.", ephemeral=True)
+    role_note = " The Nuclear Certificate role was granted." if role_granted else ""
+    if accepted and is_nuclear_certificate and not role_granted:
+        role_note = " I could not grant the Nuclear Certificate role; please check the member and my role permissions."
+    await interaction.response.send_message(f"Application #{app_id} has been {status}.{role_note}", ephemeral=True)
 
 
 async def open_application_ticket(interaction: discord.Interaction, app_id: int) -> None:
