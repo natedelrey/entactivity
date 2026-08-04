@@ -1612,13 +1612,13 @@ class CertificateApplicationStartView(discord.ui.View):
                    VALUES ($1, $2, 'pending', 'nuclear_certificate', $3, $4, $5) RETURNING id""",
                 interaction.user.id, json.dumps(answers), duration_seconds, interaction.user.joined_at, submitted_at,
             )
-        channel = bot.get_channel(CONFIG.certificate_application_channel_id)
-        if not isinstance(channel, discord.TextChannel):
+        pending_channel = bot.get_channel(CONFIG.application_pending_channel_id)
+        if not isinstance(pending_channel, discord.TextChannel):
             await dm.send(embed=application_notice_embed(
-                "Application Saved", "The review channel could not be found. Please contact management.", APPLICATION_DENIED_COLOR
+                "Application Saved", "The pending applications channel could not be found. Please contact management.", APPLICATION_DENIED_COLOR
             ))
             return
-        sent = await channel.send(
+        sent = await pending_channel.send(
             embed=build_certificate_application_embed(
                 int(app_id), interaction.user, answers, duration_seconds=duration_seconds,
                 joined_guild_at=interaction.user.joined_at, submitted_at=submitted_at,
@@ -1628,7 +1628,7 @@ class CertificateApplicationStartView(discord.ui.View):
         async with bot.db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE applications SET pending_message_id=$1, pending_channel_id=$2 WHERE id=$3",
-                sent.id, channel.id, int(app_id),
+                sent.id, pending_channel.id, int(app_id),
             )
         await dm.send(embed=application_notice_embed(
             "✅ Application Submitted", "Management will review your Nuclear Certificate application.",
@@ -1851,11 +1851,7 @@ async def process_application_decision(interaction: discord.Interaction, app_id:
     status = "accepted" if accepted else "denied"
     application_type = row["application_type"]
     is_nuclear_certificate = application_type == "nuclear_certificate"
-    destination_id = (
-        CONFIG.certificate_application_channel_id
-        if is_nuclear_certificate
-        else (CONFIG.application_accepted_channel_id if accepted else CONFIG.application_denied_channel_id)
-    )
+    destination_id = CONFIG.application_accepted_channel_id if accepted else CONFIG.application_denied_channel_id
     applicant = interaction.guild.get_member(int(row["applicant_id"])) if interaction.guild else bot.get_user(int(row["applicant_id"]))
     if applicant is None:
         applicant = await bot.fetch_user(int(row["applicant_id"]))
