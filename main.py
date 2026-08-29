@@ -2690,7 +2690,7 @@ async def task_dashboard_scheduler() -> None:
 async def before_task_dashboard_scheduler() -> None:
     await bot.wait_until_ready()
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=15)
 async def weekly_scheduler() -> None:
     if not bot.db_pool or not CONFIG.auto_weekly_report and not CONFIG.auto_weekly_reset:
         return
